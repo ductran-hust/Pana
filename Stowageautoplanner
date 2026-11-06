@@ -533,11 +533,11 @@ public static class StowageAutoPlanner
         Fill(ws, order, Math.Max(1, start), apply: true);
     }
 
-    /// <summary>FCL: cọc cao trước (vào trong); AIR / LCL: cọc nặng trước.</summary>
+    /// <summary>FCL / TRUCK: cọc cao trước (vào trong); AIR / LCL: cọc nặng trước.</summary>
     private static List<SwColumn> Order(StowageWorkspace ws, IEnumerable<SwColumn> columns)
-        => ws.NoCombine
-            ? columns.OrderByDescending(ws.ColumnWeight).ToList()
-            : columns.OrderByDescending(ws.ColumnHeight).ThenByDescending(ws.ColumnWeight).ToList();
+        => ws.Rule.TallFirst
+            ? columns.OrderByDescending(ws.ColumnHeight).ThenByDescending(ws.ColumnWeight).ToList()
+            : columns.OrderByDescending(ws.ColumnWeight).ToList();
 
     /// <summary>Chia cọc thành hàng, dồn kín từng container theo thứ tự (container 1 đầy mới sang container 2);
     /// mở sẵn <paramref name="start"/> container, thiếu chỗ thì mở thêm. Trả số container có hàng; apply = ghi vào workspace.
