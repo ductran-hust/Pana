@@ -1,0 +1,626 @@
+@namespace Swms.FinishGoods.Web.Features.Reports.App.Components
+@using System.Globalization
+@using Microsoft.Extensions.Localization
+@using Microsoft.JSInterop
+@using Swms.FinishGoods.Web.Features.Reports.Business
+@using Swms.FinishGoods.Web.Features.Reports.Business.Models
+@using Swms.FinishGoods.Web.Resources
+@using Swms.FinishGoods.Web.Shared.App.Toast
+@inject IStringLocalizer<SharedResource> L
+@inject IReportBusiness Business
+@inject ToastService Toast
+@inject IJSRuntime JS
+@implements IAsyncDisposable
+
+@* Dialog 1 báo cáo: tham số (ngày / tháng / mã SI · chuyến xe / tuổi hàng) → xem trước → tải theo ReportDef.Formats.
+   Chọn 1 ngày (‹ › lùi / tiến 1 ngày); báo cáo PickMonth chọn 1 tháng. Mở là tự xem trước;
+   đổi ngày / preset / ngưỡng tuổi tự nạp lại;
+   ô SI No chỉ đánh dấu "chưa cập nhật" — bấm Xem trước hoặc Enter. *@
+
+@if (Report is { } r)
+{
+    var g = ReportCatalog.GroupOf(r);
+    <div class="overlay" @onclick="Close">
+        <div class="swms-modal rpt-modal tone-@g.Key" @onclick:stopPropagation="true" role="dialog" aria-modal="true">
+
+            @* ── Header ── *@
+            <div class="modal-h">
+                <div class="rpt-h">
+                    <span class="rpt-h-ic">@((MarkupString)r.IconSvg)</span>
+                    <div style="min-width:0">
+                        <h3>
+                            @L[r.TitleKey]
+                            <span class="pill sm @ReportDisplay.GroupPill(r.Group)">@L[g.TitleKey]</span>
+                        </h3>
+                        <div class="text-sub" style="font-size:11.5px;margin-top:3px">@L[r.DescKey]</div>
+                    </div>
+                </div>
+                <button class="icon-btn" @onclick="Close" title="@L["Si.Btn.Close"]">
+                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M18 6L6 18M6 6l12 12" /></svg>
+                </button>
+            </div>
+
+            <div class="rpt-body">
+                @* ── Tham số ── *@
+                <div class="rpt-params">
+                    @if (r.HasDate)
+                    {
+                        <div class="field-block">
+                            <label>@L[r.DateLabelKey]</label>
+                            <div class="rpt-day">
+                                <button type="button" class="rpt-step" title="@(r.PickMonth ? L["Rpt.D.PrevMonth"] : L["Rpt.D.PrevDay"])" @onclick="@(() => Step(-1))">
+                                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><path d="m15 6-6 6 6 6" /></svg>
+                                </button>
+                                @if (r.PickMonth)
+                                {
+                                    <input type="month" value="@_date.ToString("yyyy-MM")" @onchange="OnMonthChanged" />
+                                }
+                                else
+                                {
+                                    <input type="date" value="@_date.ToString("yyyy-MM-dd")" @onchange="OnDateChanged" />
+                                }
+                                <button type="button" class="rpt-step" title="@(r.PickMonth ? L["Rpt.D.NextMonth"] : L["Rpt.D.NextDay"])" @onclick="@(() => Step(1))">
+                                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><path d="m9 6 6 6-6 6" /></svg>
+                                </button>
+                            </div>
+                        </div>
+
+                        <div class="field-block">
+                            <label>@L["Rpt.D.Quick"]</label>
+                            <div class="rpt-presets">
+                                @foreach (var p in Presets(r))
+                                {
+                                    var preset = p;
+                                    <button type="button" class="rpt-preset @(_date == PresetDate(preset) ? "on" : "")" @onclick="@(() => SetDate(PresetDate(preset)))">
+                                        @L[$"Rpt.Preset.{preset}"]
+                                    </button>
+                                }
+                            </div>
+                        </div>
+                    }
+
+                    @if (r.HasAgeing)
+                    {
+                        <div class="field-block">
+                            <label>@L["Rpt.D.AgeOver"]</label>
+                            <select value="@_age" @onchange="OnAgeChanged" style="width:130px">
+                                @foreach (var a in ReportCatalog.AgeingOptions)
+                                {
+                                    <option value="@a">@L["Rpt.D.AgeDays", a]</option>
+                                }
+                            </select>
+                        </div>
+                    }
+
+                    @if (_refMode != ReportRef.None)
+                    {
+                        <div class="field-block">
+                            <div class="field-label-row">
+                                @if (r.RefModes.Length > 1)
+                                {
+                                    @* Tra cứu theo: chuyến xe | SI No *@
+                                    <span class="rpt-refmode" role="radiogroup" aria-label="@L["Rpt.D.RefBy"]">
+                                        @foreach (var m in r.RefModes)
+                                        {
+                                            <button type="button" role="radio" aria-checked="@(m == _refMode ? "true" : "false")"
+                                                    class="@(m == _refMode ? "on" : "")" @onclick="@(() => SetRefMode(m))">@L[RefLabelKey(m)]</button>
+                                        }
+                                    </span>
+                                }
+                                else
+                                {
+                                    <label>@L[RefLabelKey(_refMode)]</label>
+                                }
+                                <span class="req">*</span>
+                            </div>
+                            <input @ref="_refInput" value="@_refNo" placeholder="@L[$"Rpt.D.{_refMode}Ph"]" style="width:190px"
+                                   class="@(NeedRef ? "need" : "")"
+                                   @oninput="OnRefInput" @onkeydown="OnRefKeyDown" />
+                        </div>
+                    }
+
+                    <button class="btn primary rpt-run" @onclick="LoadPreviewAsync" disabled="@(_loading || NeedRef)">
+                        @if (_loading)
+                        {
+                            <span class="rpt-spin"></span>
+                        }
+                        else
+                        {
+                            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M1 12s4-7 11-7 11 7 11 7-4 7-11 7-11-7-11-7z" /><circle cx="12" cy="12" r="3" /></svg>
+                        }
+                        @L["Rpt.Btn.Preview"]
+                    </button>
+                </div>
+
+                @* ── Xem trước ── *@
+                <div class="rpt-prev">
+                    <div class="rpt-prev-h">
+                        <span>@L["Rpt.D.PreviewTitle"]</span>
+                        <span class="text-sub mono" style="text-transform:none;letter-spacing:0;font-weight:500">@PeriodText</span>
+                        <span style="flex:1"></span>
+                        @if (_stale && !_loading)
+                        {
+                            <span class="pill sm warning"><span class="dot"></span>@L["Rpt.D.Stale"]</span>
+                        }
+                        else if (_preview is { } gp && !_loading)
+                        {
+                            <span class="text-sub" style="text-transform:none;letter-spacing:0;font-weight:400">@L["Rpt.D.GeneratedAt", gp.GeneratedAt.ToString("HH:mm:ss")]</span>
+                        }
+                    </div>
+
+                    @if (_preview is null)
+                    {
+                        @if (_loading)
+                        {
+                            <div class="rpt-kpis">
+                                @for (var i = 0; i < 4; i++)
+                                {
+                                    <div class="kp"><span class="skel skel-line" style="width:70px;height:9px"></span><span class="skel skel-line" style="width:56px;height:16px;margin-top:6px"></span></div>
+                                }
+                            </div>
+                            <div class="rpt-table-wrap">
+                                @for (var i = 0; i < 8; i++)
+                                {
+                                    <div class="skel-row">
+                                        <span class="skel skel-line" style="width:80px"></span>
+                                        <span class="skel skel-line" style="width:120px"></span>
+                                        <span class="skel skel-line" style="width:90px"></span>
+                                        <span class="skel skel-line" style="width:50px;margin-left:auto"></span>
+                                        <span class="skel skel-line" style="width:60px"></span>
+                                    </div>
+                                }
+                            </div>
+                        }
+                        else
+                        {
+                            <div class="empty-inline">
+                                @if (NeedRef)
+                                {
+                                    <div class="rpt-need">
+                                        @((MarkupString)r.IconSvg)
+                                        <b>@L[$"Rpt.D.{_refMode}RequiredTitle"]</b>
+                                        <span>@L[$"Rpt.{r.Key}.Need{(_refMode == r.Ref ? "" : _refMode.ToString())}"]</span>
+                                    </div>
+                                }
+                                else
+                                {
+                                    @(_loadError ?? L["Rpt.D.PickToPreview"])
+                                }
+                            </div>
+                        }
+                    }
+                    else
+                    {
+                        var p = _preview;
+                        @* Dạng chứng từ (Packing List): số tổng nằm trong phần đầu chứng từ *@
+                        @if (p.Doc is null)
+                        {
+                            <div class="rpt-kpis @(Dim ? "dim" : "")">
+                                @foreach (var k in p.Kpis)
+                                {
+                                    <div class="kp">
+                                        <span class="k">@ReportDisplay.Loc(L, k.LabelKey, k.Key)</span>
+                                        <b class="@(k.Tone is null ? "" : $"t-{k.Tone}")">@k.Value</b>
+                                    </div>
+                                }
+                            </div>
+                        }
+
+                        @* _printArea: nội dung in khi bấm Tải PDF (tạm thời — xem PrintAsync) *@
+                        <div class="rpt-table-wrap @(Dim ? "dim" : "")" @ref="_printArea">
+                            @if (p.Doc is { } doc)
+                            {
+                                <ReportDocHead Doc="doc" SiInfos="p.SiInfos" Kpis="p.Kpis" FocusSi="@p.FocusSi" />
+                            }
+                            @if (p.Containers is { Count: > 0 } conts)
+                            {
+                                <ReportStowageView Containers="conts" FocusSi="@p.FocusSi" />
+                                <div class="rpt-sec-h">@L["Rpt.Stow.PalletList"]</div>
+                            }
+                            @if (p.TotalRows == 0)
+                            {
+                                <div class="empty-inline">@L["Rpt.D.Empty"]</div>
+                            }
+                            else
+                            {
+                                <table class="data dense rpt-table">
+                                    <thead>
+                                        <tr>
+                                            <th class="no">#</th>
+                                            @foreach (var c in p.Columns)
+                                            {
+                                                <th class="@(c.AlignRight ? "r" : "")">@ReportDisplay.Loc(L, c.HeaderKey, c.Key)</th>
+                                            }
+                                        </tr>
+                                    </thead>
+                                    <tbody>
+                                        @foreach (var (row, i) in p.Rows.Select((x, i) => (x, i)))
+                                        {
+                                            <tr class="@RowClass(p, row)">
+                                                <td class="no mono text-sub">@(i + 1)</td>
+                                                @for (var ci = 0; ci < p.Columns.Count; ci++)
+                                                {
+                                                    var col = p.Columns[ci];
+                                                    var cell = ci < row.Length ? row[ci] : new ReportCell(null);
+                                                    <td class="@CellClass(col)">
+                                                        @if (cell.Tone is { } tone && cell.Text is not null)
+                                                        {
+                                                            @if (col.Kind == ReportColumnKind.Status)
+                                                            {
+                                                                <span class="pill sm @tone"><span class="dot"></span>@ReportDisplay.CellText(cell, L)</span>
+                                                            }
+                                                            else
+                                                            {
+                                                                <span class="t-@tone">@ReportDisplay.CellText(cell, L)</span>
+                                                            }
+                                                        }
+                                                        else
+                                                        {
+                                                            @ReportDisplay.CellText(cell, L)
+                                                        }
+                                                    </td>
+                                                }
+                                            </tr>
+                                        }
+                                    </tbody>
+                                    @if (p.Totals is { } tot)
+                                    {
+                                        <tfoot>
+                                            <tr>
+                                                <td class="no"></td>
+                                                @for (var ci = 0; ci < p.Columns.Count; ci++)
+                                                {
+                                                    var cell = ci < tot.Length ? tot[ci] : null;
+                                                    <td class="@CellClass(p.Columns[ci])">@(cell is null ? "" : ReportDisplay.CellText(cell, L))</td>
+                                                }
+                                            </tr>
+                                        </tfoot>
+                                    }
+                                </table>
+                            }
+                        </div>
+
+                        <div class="rpt-prev-f">
+                            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="9" /><path d="M12 8h.01M11 12h1v4h1" /></svg>
+                            @if (p.TotalRows > p.Rows.Count)
+                            {
+                                @L["Rpt.D.ShownOf", p.Rows.Count, p.TotalRows.ToString("N0")]
+                            }
+                            else
+                            {
+                                @L["Rpt.D.ShownAll", p.TotalRows.ToString("N0")]
+                            }
+                        </div>
+                    }
+                </div>
+            </div>
+
+            @* ── Footer ── *@
+            <div class="modal-f">
+                <span class="text-sub rpt-f-note">@L["Rpt.D.ExportNote"]</span>
+                <button class="btn" @onclick="Close">@L["Si.Btn.Close"]</button>
+                @if (r.Formats.Contains(ReportFormat.Excel))
+                {
+                    <button class="btn rpt-xls" @onclick="@(() => ExportAsync(ReportFormat.Excel))" disabled="@(!CanExport)">
+                        @if (_exporting == ReportFormat.Excel)
+                        {
+                            <span class="rpt-spin"></span>
+                        }
+                        else
+                        {
+                            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z" /><path d="M14 2v6h6M8 13l4 5M12 13l-4 5" /></svg>
+                        }
+                        @L["Rpt.Btn.Excel"]
+                    </button>
+                }
+                @if (r.Formats.Contains(ReportFormat.Pdf))
+                {
+                    <button class="btn rpt-pdf" @onclick="@(() => ExportAsync(ReportFormat.Pdf))" disabled="@(!CanExport)"
+                            title="@(PrintForPdf ? L["Rpt.Btn.PdfPrintHint"] : null)">
+                        @if (_exporting == ReportFormat.Pdf)
+                        {
+                            <span class="rpt-spin"></span>
+                        }
+                        else
+                        {
+                            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z" /><path d="M14 2v6h6M9 15h6M9 18h4" /></svg>
+                        }
+                        @L["Rpt.Btn.Pdf"]
+                    </button>
+                }
+            </div>
+        </div>
+    </div>
+}
+
+@code {
+    [Parameter] public ReportDef? Report { get; set; }
+    [Parameter] public EventCallback OnClose { get; set; }
+
+    // ── Tham số ──
+    private DateTime _date;
+    private string _refNo = "";             // SI No / mã chuyến xe — theo _refMode
+    private ReportRef _refMode;             // cách tra cứu đang chọn: ReportDef.Ref hoặc AltRef
+    private int _age = 90;
+
+    // ── Trạng thái ──
+    private string? _openedKey;
+    private ReportPreview? _preview;
+    private string? _loadError;
+    private bool _loading;
+    private bool _stale;                    // tham số đã đổi so với bản xem trước
+    private ReportFormat? _exporting;
+    private int _loadSeq;                   // bỏ kết quả của lần nạp cũ về muộn
+    private ElementReference _refInput;
+    private bool _focusRef;                 // vừa mở báo cáo cần mã -> đặt con trỏ vào ô mã
+
+    private static DateTime Today => DateTime.Today;
+    private bool Dim => _loading || _stale;
+    private bool CanExport => Report is not null && _exporting is null && !NeedRef;
+    /// <summary>Báo cáo cần mã (SI / chuyến xe) mà chưa nhập.</summary>
+    private bool NeedRef => _refMode != ReportRef.None && string.IsNullOrWhiteSpace(_refNo);
+
+    private static string RefLabelKey(ReportRef r) => r == ReportRef.Trip ? "Rpt.D.TripNo" : "Rpt.D.SiNo";
+
+    protected override async Task OnParametersSetAsync()
+    {
+        if (Report?.Key == _openedKey) return;
+        _openedKey = Report?.Key;
+        _preview = null;
+        _loadError = null;
+        _stale = false;
+        if (Report is null) return;
+
+        // Chọn tháng: mặc định tháng trước (đã chốt); còn lại hôm nay
+        _date = Report.PickMonth ? PresetDate("last_month") : Today;
+        _refNo = "";
+        _refMode = Report.Ref;
+        _age = 90;
+        _focusRef = Report.Ref != ReportRef.None;
+        await LoadPreviewAsync();           // cần mã: chưa nạp, chờ nhập mã
+    }
+
+    protected override async Task OnAfterRenderAsync(bool firstRender)
+    {
+        if (!_focusRef) return;
+        _focusRef = false;
+        try { await _refInput.FocusAsync(); } catch (InvalidOperationException) { }
+    }
+
+    private ReportRequest BuildRequest() => new()
+    {
+        ReportKey = Report!.Key,
+        Date = _date,
+        SiNo = _refMode == ReportRef.Si ? _refNo.Trim() : null,
+        TripNo = _refMode == ReportRef.Trip ? _refNo.Trim() : null,
+        AgeDays = _age,
+    };
+
+    // ── Xem trước ──
+    private async Task LoadPreviewAsync()
+    {
+        if (Report is null || NeedRef) return;
+        var seq = ++_loadSeq;
+        _loading = true;
+        _loadError = null;
+        StateHasChanged();
+
+        var r = await Business.GetPreviewAsync(BuildRequest());
+        if (seq != _loadSeq || Report is null) return;      // đã đổi tham số / đóng dialog
+
+        _loading = false;
+        if (r.IsSuccess && r.Value is not null)
+        {
+            _preview = r.Value;
+            _stale = false;
+        }
+        else
+        {
+            _loadError = r.ErrorMessage ?? L["Rpt.Toast.PreviewFailed"];
+            if (_preview is not null) Toast.Error(_loadError);
+        }
+    }
+
+    private async Task OnParamChanged()
+    {
+        _stale = true;
+        await LoadPreviewAsync();
+    }
+
+    // ── Ngày ──
+    private async Task SetDate(DateTime d)
+    {
+        if (d.Date == _date) return;
+        _date = d.Date;
+        await OnParamChanged();
+    }
+
+    /// <summary>‹ ›: lùi / tiến 1 ngày, hoặc 1 tháng với báo cáo chọn tháng.</summary>
+    private Task Step(int n) => SetDate(Report?.PickMonth == true
+        ? MonthEnd(new DateTime(_date.Year, _date.Month, 1).AddMonths(n))
+        : _date.AddDays(n));
+
+    private async Task OnMonthChanged(ChangeEventArgs e)
+    {
+        if (DateTime.TryParseExact(e.Value?.ToString(), "yyyy-MM", CultureInfo.InvariantCulture, DateTimeStyles.None, out var d))
+            await SetDate(MonthEnd(d));
+    }
+
+    private static DateTime MonthEnd(DateTime d) => new DateTime(d.Year, d.Month, 1).AddMonths(1).AddDays(-1);
+
+    private string PeriodText => Report switch
+    {
+        _ when _refMode != ReportRef.None => _refNo.Trim().ToUpperInvariant(),
+        { PickMonth: true } => _date.ToString("MM/yyyy"),
+        _ => _date.ToString("dd/MM/yyyy"),
+    };
+
+    private async Task OnDateChanged(ChangeEventArgs e)
+    {
+        if (DateTime.TryParseExact(e.Value?.ToString(), "yyyy-MM-dd", CultureInfo.InvariantCulture, DateTimeStyles.None, out var d))
+            await SetDate(d);
+    }
+
+    private static IEnumerable<string> Presets(ReportDef r)
+        => r.PickMonth
+            ? new[] { "this_month", "last_month" }
+            : new[] { "today", "yesterday" }.Concat(r.ExtraPresets);
+
+    /// <summary>Chọn tháng: luôn trả ngày cuối tháng.</summary>
+    private static DateTime PresetDate(string key) => key switch
+    {
+        "yesterday" => Today.AddDays(-1),
+        "this_month" => MonthEnd(Today),
+        "last_month" => MonthEnd(Today.AddMonths(-1)),
+        _ => Today,
+    };
+
+    // ── Tham số khác ──
+    private async Task OnAgeChanged(ChangeEventArgs e)
+    {
+        if (int.TryParse(e.Value?.ToString(), out var a))
+        {
+            _age = a;
+            await OnParamChanged();
+        }
+    }
+
+    private void OnRefInput(ChangeEventArgs e)
+    {
+        _refNo = e.Value?.ToString() ?? "";
+        _stale = _preview is not null;
+        if (NeedRef)
+        {
+            _loadSeq++;             // xoá mã -> bỏ bản xem trước của mã cũ
+            _preview = null;
+            _loading = false;
+        }
+    }
+
+    private void SetRefMode(ReportRef mode)
+    {
+        if (mode == _refMode) return;
+        _refMode = mode;
+        _refNo = "";                // mã chuyến / SI khác định dạng -> nhập lại
+        _loadSeq++;
+        _preview = null;
+        _loading = false;
+        _stale = false;
+        _focusRef = true;
+    }
+
+    /// <summary>Packing List tìm theo SI: dòng của SI đó nổi, SI khác cùng chuyến mờ đi.</summary>
+    private static string? RowClass(ReportPreview p, ReportCell[] row)
+    {
+        if (p.FocusSi is null) return null;
+        var ci = p.Columns.FindIndex(c => c.Key == "si_no");
+        if (ci < 0 || ci >= row.Length) return null;
+        return string.Equals(row[ci].Text, p.FocusSi, StringComparison.OrdinalIgnoreCase) ? "hit" : "off";
+    }
+
+    private async Task OnRefKeyDown(KeyboardEventArgs e)
+    {
+        if (e.Key == "Enter") await LoadPreviewAsync();
+    }
+
+    // ── In (tạm thời thay cho PDF từ API) ──
+    /*  Chưa có API xuất PDF: bấm "Tải PDF" mở hộp thoại in của trình duyệt với chính nội dung
+        đang xem trước (người dùng chọn "Lưu dưới dạng PDF"). Có API thì đặt PrintForPdf = false
+        -> nút gọi Business.ExportAsync như các định dạng khác.
+        Lưu ý: in đúng những gì đang hiện — báo cáo dạng bảng chỉ có ReportPreview.PreviewLimit dòng.  */
+    private const bool PrintForPdf = true;
+    // ?v=: đổi số mỗi lần sửa file JS -> trình duyệt không dùng bản cũ trong cache
+    private const string PrintModulePath = "./Features/Reports/App/Components/ReportDialog.razor.js?v=6";
+
+    private ElementReference _printArea;
+    private IJSObjectReference? _printModule;
+
+    private async Task PrintAsync()
+    {
+        if (Report is null || NeedRef) return;
+
+        // Bản xem trước cũ / chưa có -> nạp lại rồi chờ vẽ xong mới in
+        if (_stale || _preview is null)
+        {
+            await LoadPreviewAsync();
+            if (_preview is null) return;
+            StateHasChanged();
+            await Task.Delay(50);
+        }
+
+        try
+        {
+            _printModule ??= await JS.InvokeAsync<IJSObjectReference>("import", PrintModulePath);
+            await _printModule.InvokeAsync<bool>("printReport", _printArea, FileBaseName());
+        }
+        catch (JSDisconnectedException) { }
+        catch (JSException ex)
+        {
+            Toast.Error($"{L["Rpt.Toast.ExportFailed"]} ({ex.Message})");
+        }
+    }
+
+    /// <summary>Tên file gợi ý khi lưu PDF: swms_{báo cáo}_{ngày | tháng | mã}.</summary>
+    private string FileBaseName()
+    {
+        var r = Report!;
+        var part = _refMode != ReportRef.None ? _refNo.Trim().ToUpperInvariant()
+                 : r.PickMonth ? _date.ToString("yyyyMM")
+                 : _date.ToString("yyyyMMdd");
+        return $"swms_{r.Key}_{part}";
+    }
+
+    public async ValueTask DisposeAsync()
+    {
+        try
+        {
+            if (_printModule is not null) await _printModule.DisposeAsync();
+        }
+        catch (JSDisconnectedException) { }
+    }
+
+    // ── Tải file ──
+    private async Task ExportAsync(ReportFormat format)
+    {
+        if (!CanExport) return;
+        if (format == ReportFormat.Pdf && PrintForPdf)
+        {
+            await PrintAsync();
+            return;
+        }
+        _exporting = format;
+        var r = await Business.ExportAsync(BuildRequest(), format);
+        _exporting = null;
+
+        if (!r.IsSuccess || r.Value is null)
+        {
+            Toast.Error(r.ErrorMessage ?? L["Rpt.Toast.ExportFailed"]);
+            return;
+        }
+
+        var file = r.Value;
+        if (file.Content is { Length: > 0 } bytes)
+        {
+            await JS.InvokeVoidAsync("swmsSaveFile", file.FileName, file.ContentType, Convert.ToBase64String(bytes));
+            Toast.Success(L["Rpt.Toast.Exported", file.FileName]);
+        }
+        else
+        {
+            Toast.Success(L["Rpt.Toast.MockExport", file.FileName]);
+        }
+    }
+
+    private async Task Close()
+    {
+        _loadSeq++;                 // bỏ kết quả đang chờ
+        _openedKey = null;
+        await OnClose.InvokeAsync();
+    }
+
+    private static string CellClass(ReportColumn c) => c.Kind switch
+    {
+        ReportColumnKind.Number => "r num",
+        ReportColumnKind.Mono => "mono",
+        _ => "",
+    };
+}
