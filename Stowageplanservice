@@ -1,0 +1,575 @@
+using Microsoft.Extensions.Localization;
+using Swms.FinishGoods.API.Common.Business.Exceptions;
+using Swms.FinishGoods.API.Features.Auth.Common;
+using Swms.FinishGoods.API.Features.StowagePlans.Api;
+using Swms.FinishGoods.API.Features.StowagePlans.DataAccess;
+using Swms.FinishGoods.API.Resource;
+using Swms.FinishGoods.API.Shared.Business.Exceptions;
+using Swms.FinishGoods.API.Shared.DataAccess;
+using System.Globalization;
+using System.Text.RegularExpressions;
+
+namespace Swms.FinishGoods.API.Features.StowagePlans.Business;
+
+/*  Stowage Plan — sơ đồ xếp hàng vào container.
+
+    Hiện tại 1 plan = 1 chuyến xe (màn Chuyến xe), cả container lẫn xe tải:
+      - Xe container (FCL)      -> CONT, loại cont theo chuyến (20F / 40F / 40H / 45H)
+      - Xe tải chở AIR          -> ULD, sơ đồ theo cont 40H (cùng cỡ container thường, không còn mâm PMC)
+      - Xe tải chở LCL          -> LOT, sơ đồ theo cont 40H (hàng LCL đóng ghép cont ở kho CFS)
+      - Xe tải chở TRUCK        -> TRUCK, sơ đồ theo thùng xe (ContainerSpec.Trucks, cỡ xe lấy từ container_size của chuyến)
+      - Danh sách = chuyến còn mở (planned / arrived / sealed). Chuyến chưa lập sơ đồ
+        có số plan tạm "VP-T{tripId}", trạng thái NotStarted; lưu lần đầu mới tạo dòng stowage_plans
+        với đúng số đó, container #0 gắn chuyến.
+      - SI, số cont, loại cont, FWD lấy SỐNG từ chuyến (văn phòng sửa chuyến -> sơ đồ thấy ngay);
+        header plan chỉ là bản chép để liệt kê / tra cứu.
+    Sau này lập theo order (chỉ có mã + số lượng, tự chia container): plan không gắn chuyến,
+    SI lấy từ stowage_plan_sis — đọc / lưu đi cùng đường.
+
+    Soạn pallet / ghép cọc / xếp container chạy ở Web (StowageWorkspace). Server kiểm cấu trúc:
+      box thuộc plan, 1 SI / pallet, mỗi box 1 pallet, mỗi pallet 1 cọc, AIR / LCL không chồng
+      (FCL / TRUCK chồng được), cọc nằm trong sàn container / thùng xe, mỗi ô 1 cọc. Chiều cao / tải trọng do Web chặn trước khi lưu.
+    Đủ mọi cọc có vị trí -> saved, chưa đủ -> draft (server tự tính, không tin cờ Complete).     */
+public class StowagePlanService : IStowagePlanService
+{
+    private const int MaxList = 300;
+    private const int MaxRows = 60;              // giống StowageWorkspace.MaxRowIndex bên Web
+    private const string TripPlanPrefix = "VP-T";
+    private static readonly Regex TripPlanNo = new(@"^VP-T(\d{1,18})$", RegexOptions.Compiled | RegexOptions.IgnoreCase);
+
+    private readonly IStowagePlanRepository _repo;
+    private readonly ICurrentUser _currentUser;
+    private readonly IStringLocalizer<SharedResource> _localizer;
+
+    public StowagePlanService(
+        IStowagePlanRepository repo,
+        ICurrentUser currentUser,
+        IStringLocalizer<SharedResource> localizer)
+    {
+        _repo = repo;
+        _currentUser = currentUser;
+        _localizer = localizer;
+    }
+
+    // ═══════════════════════════════════════════════════════════════
+    //  Đọc
+    // ═══════════════════════════════════════════════════════════════
+
+    public async Task<List<VanningPlanSummaryDto>> GetListAsync(StowagePlanQuery query)
+    {
+        var q = Clean(query.Keyword);
+        var from = query.From?.Date;
+        DateTime? toExclusive = null;
+        if (from is { } f)
+        {
+            var to = query.To?.Date ?? f;
+            toExclusive = (to < f ? f : to).AddDays(1);
+        }
+        var rows = (await _repo.GetTripPlansAsync(q, from, toExclusive, MaxList))
+            .Concat(await _repo.GetStandalonePlansAsync(q, from, toExclusive, MaxList));
+
+        var list = rows.Select(r =>
+        {
+            var mode = NormalizeMode(r.ShipMode);
+            return new VanningPlanSummaryDto
+            {
+                PlanNo = r.PlanNo ?? PlanNoOfTrip(r.TripId!.Value),
+                TripId = r.TripId,
+                TripNo = r.TripNo,
+                UnitKind = r.TripId is null ? r.UnitKind : KindOf(r.VehicleType, mode),
+                UnitNo = r.UnitNo ?? "—",
+                ContainerType = r.TripId is null ? r.ContainerType ?? "" : TypeOf(r.VehicleType, mode, r.ContainerType),
+                Destination = r.Destination ?? "",
+                Mode = mode,
+                SiCount = r.SiCount,
+                BoxCount = r.BoxCount,
+                Status = ParseStatus(r.PlanStatus),
+                PlacedColumns = r.PlacedColumns,
+                TotalColumns = r.TotalColumns,
+            };
+        });
+
+        if (query.Status is { } st) list = list.Where(x => x.Status == st);
+        return list.ToList();
+    }
+
+    public async Task<StowagePlanDto> GetAsync(string planNo)
+        => await BuildAsync(await LoadAsync(planNo));
+
+    // ═══════════════════════════════════════════════════════════════
+    //  Lưu
+    // ═══════════════════════════════════════════════════════════════
+
+    public async Task<StowagePlanDto> SaveAsync(string planNo, SaveStowagePlanRequest request)
+    {
+        var ctx = await LoadAsync(planNo);
+
+        if (ctx.Trip is { Status: "departed" or "cancelled" } closed)
+            throw Bad("StowagePlan.TripClosed", UnitNoOf(ctx), closed.Status);
+        if (ctx.Sis.Count == 0)
+            throw Bad("StowagePlan.NoSi");
+
+        var mode = ModeOf(ctx);
+        var noCombine = mode is "AIR" or "LCL";
+        var spec = ContainerSpec.Of(ContainerTypeOf(ctx));
+
+        var boxes = await _repo.GetBoxesAsync(ctx.Sis.Select(s => s.SiId).ToList());
+        var keys = BoxKeys(boxes);
+        var boxByKey = boxes.ToDictionary(b => keys[b.Ident], b => b, StringComparer.OrdinalIgnoreCase);
+        var siByNo = ctx.Sis.ToDictionary(s => s.SiNo, s => s, StringComparer.OrdinalIgnoreCase);
+
+        // ── Pallet: 1 SI / pallet, box thuộc plan, mỗi box 1 pallet ──
+        var pallets = new Dictionary<string, PalletSave>(StringComparer.Ordinal);
+        var palletCodes = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        var usedBoxes = new HashSet<string>(StringComparer.Ordinal);
+        double boxWeight = 0;
+        double baseWeight = 0;
+        var planBase = PlanBase(ctx, mode);       // đế cho SI không ghi packing type (giống Web)
+
+        foreach (var p in request.Pallets)
+        {
+            var code = Clean(p.Code) ?? throw Bad("StowagePlan.Err.Code");
+            if (pallets.ContainsKey(p.PalletNo) || !palletCodes.Add(code))
+                throw Bad("StowagePlan.Err.DuplicatePallet", code);
+            if (!siByNo.TryGetValue(p.SiNo, out var si))
+                throw Bad("StowagePlan.Err.UnknownSi", code, p.SiNo);
+            if (p.BoxNos.Count == 0)
+                throw Bad("StowagePlan.Err.EmptyPallet", code);
+
+            var refs = new List<BoxRef>(p.BoxNos.Count);
+            foreach (var bn in p.BoxNos)
+            {
+                if (!boxByKey.TryGetValue(bn, out var b))
+                    throw Bad("StowagePlan.Err.UnknownBox", code, bn);
+                if (b.SiId != si.SiId)
+                    throw Bad("StowagePlan.Err.BoxOtherSi", code, bn, b.SiNo);
+                if (!usedBoxes.Add(b.Ident))
+                    throw Bad("StowagePlan.Err.BoxTwice", bn);
+                refs.Add(new BoxRef(b.SiBoxId, b.SiLineId, b.CartonSeq));
+                boxWeight += b.Weight ?? 0;
+            }
+
+            baseWeight += BaseWeight(BaseOfPacking(si.PackingType) ?? planBase);
+            pallets[p.PalletNo] = new PalletSave
+            {
+                Code = code,
+                SiId = si.SiId,
+                PalletSize = Clean(p.Size) ?? "S1210",
+                LengthCm = p.PalletLength,
+                WidthCm = p.PalletWidth,
+                Boxes = refs,
+            };
+        }
+
+        // ── Cọc: tầng 1 bắt buộc, tầng 2 chỉ FCL / TRUCK, mỗi pallet 1 cọc ──
+        var columns = new Dictionary<string, ColumnSave>(StringComparer.Ordinal);
+        var columnCodes = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        var attached = new HashSet<string>(StringComparer.Ordinal);
+
+        foreach (var c in request.Columns)
+        {
+            var code = Clean(c.Code) ?? throw Bad("StowagePlan.Err.Code");
+            if (columns.ContainsKey(c.ColumnNo) || !columnCodes.Add(code))
+                throw Bad("StowagePlan.Err.DuplicateColumn", code);
+            if (c.BottomPalletNo is null)
+                throw Bad("StowagePlan.Err.EmptyColumn", code);
+            if (c.TopPalletNo is not null && noCombine)
+                throw Bad("StowagePlan.Err.NoCombine", code, mode);
+
+            Attach(c.BottomPalletNo, c.ColumnNo, code, 1);
+            if (c.TopPalletNo is not null) Attach(c.TopPalletNo, c.ColumnNo, code, 2);
+
+            columns[c.ColumnNo] = new ColumnSave { Key = c.ColumnNo, Code = code };
+        }
+
+        void Attach(string palletKey, string columnKey, string columnCode, int tier)
+        {
+            if (!pallets.TryGetValue(palletKey, out var pl))
+                throw Bad("StowagePlan.Err.UnknownPallet", columnCode);
+            if (!attached.Add(palletKey))
+                throw Bad("StowagePlan.Err.PalletTwice", pl.Code);
+            pl.ColumnKey = columnKey;
+            pl.Tier = tier;
+        }
+
+        if (pallets.FirstOrDefault(x => !attached.Contains(x.Key)).Value is { } loose)
+            throw Bad("StowagePlan.Err.PalletNoColumn", loose.Code);
+
+        // ── Vị trí: mỗi ô 1 cọc, mỗi cọc 1 ô; hàng sâu theo cọc (xoay ngang / dọc), không chia ô 120×100 cố định ──
+        var slots = new HashSet<(int, int, int)>();
+        foreach (var x in request.Placements)
+        {
+            if (!columns.TryGetValue(x.ColumnNo, out var col))
+                throw Bad("StowagePlan.Err.UnknownColumn");
+            if (col.ContainerIndex is not null)
+                throw Bad("StowagePlan.Err.ColumnTwice", col.Code);
+            if (x.ContainerIndex >= request.ContainerCount || x.Row >= MaxRows || x.Lane >= spec.Lanes)
+                throw Bad("StowagePlan.Err.SlotOutOfRange", col.Code, spec.Code);
+            if (!slots.Add((x.ContainerIndex, x.Row, x.Lane)))
+                throw Bad("StowagePlan.Err.SlotTaken", col.Code, x.ContainerIndex + 1, x.Row + 1);
+
+            col.ContainerIndex = x.ContainerIndex;
+            col.RowNo = x.Row;
+            col.LaneNo = x.Lane;
+            col.Rotated = x.Rotated;
+        }
+
+        // Vừa sàn: mặt cọc = lớn nhất các pallet trong cọc (slip sheet / thùng rời gửi mặt hộp);
+        // mỗi hàng tổng bề ngang ≤ lòng cont, tổng độ sâu các hàng ≤ chiều dài cont (dư 1 cm).
+        var foot = pallets.Values.GroupBy(p => p.ColumnKey)
+            .ToDictionary(g => g.Key, g => (L: g.Max(p => p.LengthCm), W: g.Max(p => p.WidthCm)));
+        foreach (var cont in columns.Values.Where(c => c.ContainerIndex is not null).GroupBy(c => c.ContainerIndex!.Value))
+        {
+            double length = 0;
+            foreach (var row in cont.GroupBy(c => c.RowNo!.Value).OrderBy(g => g.Key))
+            {
+                var ext = row.Select(c => foot.TryGetValue(c.Key, out var f)
+                    ? (c.Rotated ? (Depth: f.W, Span: f.L) : (Depth: f.L, Span: f.W))
+                    : (Depth: 0, Span: 0)).ToList();
+                if (ext.Sum(e => e.Span) > spec.InnerWidth + 1)
+                    throw Bad("StowagePlan.Err.SlotOutOfRange", row.First().Code, spec.Code);
+                length += ext.Max(e => e.Depth);
+                if (length > spec.InnerLength + 1)
+                    throw Bad("StowagePlan.Err.SlotOutOfRange", row.First().Code, spec.Code);
+            }
+        }
+
+        var placed = columns.Values.Count(c => c.ContainerIndex is not null);
+        var complete = columns.Count > 0 && placed == columns.Count;
+
+        var save = new PlanSave
+        {
+            Plan = new PlanRow
+            {
+                Id = ctx.Plan?.Id ?? 0,
+                PlanNo = ctx.Plan?.PlanNo ?? ctx.PlanNo,
+                UnitKind = UnitKindOf(ctx),
+                ShipMode = mode,
+                ContainerType = ContainerTypeOf(ctx),
+                ForwarderCode = ForwarderOf(ctx),
+                VanningDate = ctx.Sis.Min(s => s.VanningDate ?? s.EtdDate),
+                EtdDate = ctx.Sis.Min(s => s.EtdDate),
+                Destination = DestinationOf(ctx),
+                BaseType = ToDb(planBase),                // theo packing type của SI, không lấy từ request
+                Status = complete ? "saved" : "draft",
+                TotalBoxes = boxes.Count,
+                TotalPallets = pallets.Count,
+                TotalColumns = columns.Count,
+                PlacedColumns = placed,
+                TotalWeightKg = (decimal)Math.Round(boxWeight + baseWeight, 3),
+            },
+            TripId = ctx.Trip?.Id,
+            UnitNo = ctx.Trip is { } t ? t.ContainerNo ?? t.PlateNo : null,
+            ContainerCount = request.ContainerCount,
+            Sis = ctx.Sis.Select((s, i) => (s.SiId, Sort: i)).ToList(),
+            Columns = columns.Values.ToList(),
+            Pallets = pallets.Values.ToList(),
+            Actor = _currentUser.FullName,
+        };
+
+        if (await _repo.SaveAsync(save) == 0)
+            throw new ConflictException(_localizer["StowagePlan.Deleted", save.Plan.PlanNo]);
+
+        return await GetAsync(save.Plan.PlanNo);
+    }
+
+    // ═══════════════════════════════════════════════════════════════
+    //  Nạp plan / chuyến
+    // ═══════════════════════════════════════════════════════════════
+
+    private sealed class PlanContext
+    {
+        public string PlanNo { get; init; } = "";
+        public PlanRow? Plan { get; init; }
+        public TripHeadRow? Trip { get; set; }
+        public List<PlanContainerRow> Containers { get; set; } = new();
+        public List<StowSiRow> Sis { get; set; } = new();
+    }
+
+    private async Task<PlanContext> LoadAsync(string planNo)
+    {
+        var no = Clean(planNo) ?? throw NotFound(planNo);
+
+        if (await _repo.GetPlanAsync(no) is { } plan)
+        {
+            var ctx = new PlanContext { PlanNo = plan.PlanNo, Plan = plan };
+            ctx.Containers = await _repo.GetContainersAsync(plan.Id);
+            var planSis = await _repo.GetPlanSisAsync(plan.Id);
+
+            if (ctx.Containers.FirstOrDefault(c => c.ContainerIndex == 0)?.TripId is { } tripId)
+                ctx.Trip = await _repo.GetTripAsync(tripId);
+
+            if (ctx.Trip is null)
+            {
+                ctx.Sis = planSis;
+            }
+            else
+            {
+                // SI sống theo chuyến, giữ màu đã lưu
+                var colors = planSis.ToDictionary(s => s.SiId, s => s.Color);
+                ctx.Sis = await _repo.GetTripSisAsync(ctx.Trip.Id);
+                foreach (var s in ctx.Sis) s.Color = colors.GetValueOrDefault(s.SiId);
+            }
+            return ctx;
+        }
+
+        // Chuyến chưa lập sơ đồ: "VP-T{tripId}"
+        var m = TripPlanNo.Match(no);
+        if (!m.Success || !long.TryParse(m.Groups[1].Value, out var id))
+            throw NotFound(no);
+
+        var trip = await _repo.GetTripAsync(id)
+            ?? throw NotFound(no);
+
+        // Chuyến đã có plan mang số khác (vd plan lập theo order rồi gắn chuyến) -> mở plan đó
+        if (await _repo.GetPlanNoOfTripAsync(id) is { } existing
+            && !string.Equals(existing, no, StringComparison.OrdinalIgnoreCase))
+            return await LoadAsync(existing);
+
+        return new PlanContext
+        {
+            PlanNo = PlanNoOfTrip(id),
+            Trip = trip,
+            Sis = await _repo.GetTripSisAsync(id),
+        };
+    }
+
+    private async Task<StowagePlanDto> BuildAsync(PlanContext ctx)
+    {
+        var mode = ModeOf(ctx);
+        var boxes = await _repo.GetBoxesAsync(ctx.Sis.Select(s => s.SiId).ToList());
+        var keys = BoxKeys(boxes);
+        var siNo = ctx.Sis.ToDictionary(s => s.SiId, s => s.SiNo);
+
+        var dto = new StowagePlanDto
+        {
+            PlanNo = ctx.Plan?.PlanNo ?? ctx.PlanNo,
+            TripId = ctx.Trip?.Id,
+            TripNo = ctx.Trip?.TripNo,
+            UnitKind = UnitKindOf(ctx),
+            UnitNo = UnitNoOf(ctx),
+            ContainerType = ContainerTypeOf(ctx),
+            Destination = DestinationOf(ctx) ?? "",
+            Etd = ctx.Sis.Count > 0 ? ctx.Sis.Min(s => s.EtdDate) : ctx.Plan?.EtdDate,
+            Forwarder = ForwarderOf(ctx),
+            Mode = mode,
+            BaseType = PlanBase(ctx, mode),
+            Status = ParseStatus(ctx.Plan?.Status),
+            ContainerCount = Math.Max(1, ctx.Containers.Count),
+            Sis = ctx.Sis.Select(s => new StowageSiDto
+            {
+                SiNo = s.SiNo,
+                Customer = s.ConsigneeCode ?? "",
+                Color = string.IsNullOrWhiteSpace(s.Color) ? null : s.Color.Trim(),
+                PackingType = Clean(s.PackingType),
+                BaseType = BaseOfPacking(s.PackingType),
+            }).ToList(),
+            Boxes = boxes.Select(b => new StowageBoxDto
+            {
+                BoxNo = keys[b.Ident],
+                SiNo = b.SiNo,
+                Model = b.Model,
+                Length = b.Length ?? 0,
+                Width = b.Width ?? 0,
+                Height = b.Height ?? 0,
+                Weight = b.Weight ?? 0,
+                LayerLimit = b.LayerLimit is > 0 ? b.LayerLimit : null,
+                IsEstimated = b.IsEstimated,
+            }).ToList(),
+        };
+
+        if (ctx.Plan is null) return dto;
+
+        var columns = await _repo.GetColumnsAsync(ctx.Plan.Id);
+        // Pallet của SI đã rời chuyến: bỏ (Web dựng lại cọc thiếu đáy)
+        var pallets = (await _repo.GetPalletsAsync(ctx.Plan.Id)).Where(p => siNo.ContainsKey(p.SiId)).ToList();
+        // Thùng đã lưu nhưng không còn trong danh sách (vd thùng dự kiến, nay đã lấy hàng thành box thật) -> bỏ
+        var palletBoxes = (await _repo.GetPalletBoxesAsync(ctx.Plan.Id))
+            .GroupBy(x => x.StowagePalletId)
+            .ToDictionary(g => g.Key, g => g.Select(x => x.Ident).ToList());
+
+        foreach (var p in pallets)
+        {
+            dto.Pallets.Add(new StowagePalletDto
+            {
+                PalletNo = Id(p.Id),
+                Code = p.Code,
+                SiNo = siNo[p.SiId],
+                Size = p.PalletSize,
+                PalletLength = p.LengthCm,
+                PalletWidth = p.WidthCm,
+                BoxNos = palletBoxes.GetValueOrDefault(p.Id)?
+                    .Where(keys.ContainsKey).Select(b => keys[b]).ToList() ?? new(),
+            });
+        }
+
+        var byColumn = pallets.ToLookup(p => p.ColumnId);
+        foreach (var c in columns)
+        {
+            dto.Columns.Add(new StowageColumnDto
+            {
+                ColumnNo = Id(c.Id),
+                Code = c.Code,
+                BottomPalletNo = byColumn[c.Id].FirstOrDefault(p => p.Tier == 1) is { } b ? Id(b.Id) : null,
+                TopPalletNo = byColumn[c.Id].FirstOrDefault(p => p.Tier == 2) is { } t ? Id(t.Id) : null,
+            });
+
+            if (c.ContainerIndex is { } ci && c.RowNo is { } row && c.LaneNo is { } lane)
+                dto.Placements.Add(new StowagePlacementDto
+                {
+                    ContainerIndex = ci,
+                    Row = row,
+                    Lane = lane,
+                    ColumnNo = Id(c.Id),
+                    Rotated = c.Rotated,
+                });
+        }
+
+        return dto;
+    }
+
+    // ═══════════════════════════════════════════════════════════════
+    //  Helper
+    // ═══════════════════════════════════════════════════════════════
+
+    private static string PlanNoOfTrip(long tripId) => TripPlanPrefix + tripId.ToString(CultureInfo.InvariantCulture);
+
+    private static string Id(long id) => id.ToString(CultureInfo.InvariantCulture);
+
+    /// <summary>Khoá thùng gửi Web, theo Ident (định danh DB):
+    ///   box thật     -> số box; số trùng giữa các SI của plan thì "{box_no}#{id}"
+    ///   thùng dự kiến -> "{si_no}/{line_no}/{seq:000}" (vd MW202611N2/1/007)</summary>
+    private static Dictionary<string, string> BoxKeys(List<StowBoxRow> boxes)
+    {
+        var dup = boxes.Where(b => b.BoxNo is not null)
+            .GroupBy(b => b.BoxNo!, StringComparer.OrdinalIgnoreCase)
+            .Where(g => g.Count() > 1)
+            .Select(g => g.Key)
+            .ToHashSet(StringComparer.OrdinalIgnoreCase);
+
+        return boxes.ToDictionary(b => b.Ident, b => b.SiBoxId is { } id
+            ? (dup.Contains(b.BoxNo!) ? $"{b.BoxNo}#{id}" : b.BoxNo!)
+            : string.Create(CultureInfo.InvariantCulture, $"{b.SiNo}/{b.LineNo}/{b.CartonSeq:000}"),
+            StringComparer.Ordinal);
+    }
+
+    /// <summary>"FCL 40H" / "fcl" -> FCL; "TRUCK 5T" -> TRUCK. Không rõ -> FCL.
+    /// Phải giống ShipModeRule.All bên Web.</summary>
+    private static string NormalizeMode(string? shipMode)
+    {
+        var first = (shipMode ?? "").Trim().Split(' ', StringSplitOptions.RemoveEmptyEntries).FirstOrDefault()?.ToUpperInvariant();
+        return first is "FCL" or "LCL" or "AIR" or "TRUCK" ? first : "FCL";
+    }
+
+    private static string ModeOf(PlanContext ctx)
+        => ctx.Sis.Select(s => s.ShipMode).FirstOrDefault(m => !string.IsNullOrWhiteSpace(m)) is { } m
+            ? NormalizeMode(m)
+            : NormalizeMode(ctx.Plan?.ShipMode);
+
+    /// <summary>Loại đơn vị theo chuyến: xe container -> CONT; xe tải AIR -> ULD; xe tải TRUCK -> TRUCK;
+    /// xe tải LCL / khác -> LOT.</summary>
+    private static string KindOf(string? vehicleType, string mode)
+        => vehicleType == "container" ? "CONT" : mode switch { "AIR" => "ULD", "TRUCK" => "TRUCK", _ => "LOT" };
+
+    /// <summary>Loại sàn để vẽ:
+    ///   TRUCK bằng xe tải -> thùng xe theo cỡ xe của chuyến ("5T", "TRK-5T"…); chưa ghi / không nhận ra -> xe lớn nhất.
+    ///   Còn lại -> cỡ cont của chuyến; xe tải chở AIR / LCL chưa ghi cỡ -> cont 40H như container thường
+    ///   (hàng đóng tiếp vào cont / ULD ở CFS, sân bay).</summary>
+    private static string TypeOf(string? vehicleType, string mode, string? size)
+    {
+        if (mode == "TRUCK" && vehicleType != "container")
+            return (ContainerSpec.Truck(size) ?? ContainerSpec.LargestTruck).Code;
+        return Clean(size) is { } s && !s.Contains("PMC", StringComparison.OrdinalIgnoreCase)
+               && ContainerSpec.Truck(s) is null ? s : "40H";
+    }
+
+    private static string UnitKindOf(PlanContext ctx)
+        => ctx.Trip is { } t ? KindOf(t.VehicleType, ModeOf(ctx)) : ctx.Plan?.UnitKind ?? "CONT";
+
+    private static string ContainerTypeOf(PlanContext ctx)
+        => ctx.Trip is { } t
+            ? TypeOf(t.VehicleType, ModeOf(ctx), t.ContainerSize)
+            : Clean(ctx.Plan?.ContainerType) ?? "40H";
+
+    private static string? ForwarderOf(PlanContext ctx)
+        => Clean(ctx.Trip?.ForwarderCode)
+           ?? ctx.Sis.Select(s => Clean(s.ForwarderCode)).FirstOrDefault(x => x is not null)
+           ?? Clean(ctx.Plan?.ForwarderCode);
+
+    private static string? DestinationOf(PlanContext ctx)
+        => ctx.Sis.Select(s => Clean(s.Destination)).FirstOrDefault(x => x is not null) ?? Clean(ctx.Plan?.Destination);
+
+    private static string UnitNoOf(PlanContext ctx)
+        => Clean(ctx.Trip?.ContainerNo)
+           ?? Clean(ctx.Trip?.PlateNo)
+           ?? Clean(ctx.Containers.FirstOrDefault(c => c.ContainerIndex == 0)?.UnitNo)
+           ?? "—";
+
+    private static StowageStatus ParseStatus(string? s) => s switch
+    {
+        "draft" => StowageStatus.Draft,
+        "saved" => StowageStatus.Saved,
+        _ => StowageStatus.NotStarted,
+    };
+
+    private static string ToDb(PalletBaseType t) => t switch
+    {
+        PalletBaseType.Wood => "wood",
+        PalletBaseType.Plastic => "plastic",
+        PalletBaseType.Loose => "loose",
+        PalletBaseType.Paper => "paper",
+        _ => "no_base",
+    };
+
+    private static PalletBaseType FromDb(string? s) => s switch
+    {
+        "wood" => PalletBaseType.Wood,
+        "plastic" => PalletBaseType.Plastic,
+        "loose" => PalletBaseType.Loose,
+        "paper" => PalletBaseType.Paper,
+        _ => PalletBaseType.NoBase,
+    };
+
+    /// <summary>Phải giống StowageWorkspace.BaseWeightOf bên Web.</summary>
+    private static double BaseWeight(PalletBaseType t) => t switch
+    {
+        PalletBaseType.Wood => 20,
+        PalletBaseType.Plastic => 12,
+        PalletBaseType.Paper => 5,
+        _ => 0,
+    };
+
+    /// <summary>Packing type trên SI -> loại đế. Không nhận ra -> null (dùng đế mặc định theo hình thức).
+    ///   PLASTIC PALLET -> Plastic · Paper pallet -> Paper · SLIP SHEET -> NoBase (tấm lót)
+    ///   CARTON BOX / Double Carton -> Loose (thùng rời, không đế) · có chữ WOOD -> Wood</summary>
+    private static PalletBaseType? BaseOfPacking(string? packingType)
+    {
+        var t = string.Join(' ', (packingType ?? "").ToUpperInvariant()
+            .Split(' ', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries));
+        if (t.Length == 0) return null;
+        if (t.Contains("PLASTIC")) return PalletBaseType.Plastic;
+        if (t.Contains("PAPER")) return PalletBaseType.Paper;
+        if (t.Contains("SLIP")) return PalletBaseType.NoBase;
+        if (t.Contains("WOOD")) return PalletBaseType.Wood;
+        if (t.Contains("CARTON")) return PalletBaseType.Loose;      // CARTON BOX, DOUBLE CARTON
+        return null;
+    }
+
+    private static PalletBaseType DefaultBase(string mode) => mode == "AIR" ? PalletBaseType.Plastic : PalletBaseType.NoBase;
+
+    /// <summary>Đế chung của plan (lưu header / SI không ghi packing type): loại đế nhiều SI dùng nhất.</summary>
+    private static PalletBaseType PlanBase(PlanContext ctx, string mode)
+        => ctx.Sis.Select(s => BaseOfPacking(s.PackingType))
+               .Where(b => b is not null)
+               .GroupBy(b => b!.Value)
+               .OrderByDescending(g => g.Count())
+               .Select(g => (PalletBaseType?)g.Key)
+               .FirstOrDefault()
+           ?? (ctx.Plan is not null ? FromDb(ctx.Plan.BaseType) : DefaultBase(mode));
+
+    private BusinessRuleException Bad(string key, params object[] args) => new(_localizer[key, args]);
+
+    private NotFoundException NotFound(string? planNo) => new(_localizer["StowagePlan.NotFound", planNo ?? ""]);
+
+    private static string? Clean(string? v) => string.IsNullOrWhiteSpace(v) ? null : v.Trim();
+}
