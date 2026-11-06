@@ -331,16 +331,17 @@ public static class StowageAutoPlanner
     }
 
     // ── 2 + 3. Ghép cọc rồi xếp container ────────────────────
-    // FCL ưu tiên DÀN HẾT pallet ra sàn tới tận cửa container, chỉ chồng khi sàn thật sự không đủ:
-    //   1. C = số container ít nhất = max(khi chồng hết mức có thể, theo tải trọng) — xếp thử thật (Fill),
-    //      không ước tính theo ô sàn.
-    //   2. Tìm số cọc đôi ÍT NHẤT mà mọi cọc vẫn vừa C container -> sàn kín tới cửa, ít chồng nhất.
-    //   Cọc đôi dùng trước các CẶP VỪA KHÍT CỘT đã soạn ở bước 1 (cột cao tới đúng lòng cont).
+    // FCL: DỒN KÍN container trước rồi mới sang container sau; container cuối dàn ra sàn tới tận cửa.
+    //   1. Chồng hết mức có thể (cặp vừa khít cột trước), xếp nối tiếp -> C = số container ít nhất
+    //      (không ít hơn số container theo tải trọng).
+    //   2. C = 1: tìm số cọc đôi ÍT NHẤT mà mọi cọc vẫn vừa 1 container -> sàn kín tới cửa, ít chồng nhất.
+    //   3. C > 1: container 1 … C−1 giữ chồng hết mức (dồn kín cả chiều cao); chỉ phần hàng của container
+    //      cuối được soạn lại với số cọc đôi ít nhất mà vẫn vừa 1 container.
     // AIR / LCL không chồng: mọi pallet là cọc đơn.
     private static void BuildColumnsAndPlace(StowageWorkspace ws, List<(SwPallet Bottom, SwPallet Top)> fitPairs)
     {
-        var n = ws.Pallets.Count;
-        if (n == 0)
+        var all = ws.Pallets.ToList();
+        if (all.Count == 0)
         {
             ws.ContainerCount = 1;
             return;
@@ -348,47 +349,94 @@ public static class StowageAutoPlanner
 
         if (ws.NoCombine)
         {
-            BuildColumns(ws, 0, fitPairs);
+            BuildColumns(ws, all, 0, fitPairs);
             PlaceColumns(ws, null);
             return;
         }
 
-        var byWeight = (int)Math.Ceiling(ws.Pallets.Sum(p => ws.Layout(p).Weight) / Math.Max(1, ws.Spec.MaxPayload));
+        var byWeight = (int)Math.Ceiling(all.Sum(p => ws.Layout(p).Weight) / Math.Max(1, ws.Spec.MaxPayload));
 
-        int Needed(int doubles, int start)
+        // Số container cần khi xếp thử nhóm pallet với số cọc đôi cho trước (xếp nối tiếp từ container offset)
+        int Needed(List<SwPallet> pallets, int doubles, int start, int offset)
         {
-            ws.Columns.Clear();
-            BuildColumns(ws, doubles, fitPairs);
-            return Fill(ws, Order(ws), start, apply: false);
+            var before = ws.Columns.Count;
+            BuildColumns(ws, pallets, doubles, fitPairs);
+            var cols = ws.Columns.Skip(before).ToList();
+            var used = Fill(ws, Order(ws, cols), start, apply: false, offset);
+            ws.Columns.RemoveRange(before, cols.Count);
+            return used;
         }
 
-        var maxDoubles = n / 2;
-        var target = Math.Max(1, Math.Max(byWeight, Needed(maxDoubles, 1)));
-
-        // Ít cọc đôi nhất mà vẫn vừa target container (càng ít chồng, pallet càng trải ra tới cửa)
-        int lo = 0, hi = maxDoubles;
-        while (lo < hi)
+        // Ít cọc đôi nhất mà nhóm pallet vẫn vừa số container cho trước
+        int FewestDoubles(List<SwPallet> pallets, int containers, int offset)
         {
-            var mid = (lo + hi) / 2;
-            if (Needed(mid, target) <= target) hi = mid; else lo = mid + 1;
+            int lo = 0, hi = pallets.Count / 2;
+            while (lo < hi)
+            {
+                var mid = (lo + hi) / 2;
+                if (Needed(pallets, mid, containers, offset) <= containers) hi = mid; else lo = mid + 1;
+            }
+            return lo;
         }
 
+        // 1. Chồng hết mức -> số container ít nhất
         ws.Columns.Clear();
-        BuildColumns(ws, lo, fitPairs);
+        var target = Math.Max(1, Math.Max(byWeight, Needed(all, all.Count / 2, 1, 0)));
+
+        // 2. Vừa 1 container: dàn ra sàn tới cửa, ít chồng nhất
+        if (target == 1)
+        {
+            BuildColumns(ws, all, FewestDoubles(all, 1, 0), fitPairs);
+            PlaceColumns(ws, 1);
+            return;
+        }
+
+        // 3. Nhiều container: chồng hết mức, dồn kín từ container 1
+        BuildColumns(ws, all, all.Count / 2, fitPairs);
         PlaceColumns(ws, target);
+
+        // Container cuối: soạn lại cọc của riêng nó với ít cọc đôi nhất
+        var last = ws.ContainerCount - 1;
+        if (last <= 0) return;
+        var lastCols = ws.Columns
+            .Where(c => ws.PlacementOf(c.Id) is not { } pl || pl.ContainerIndex == last)
+            .ToList();
+        var lastPallets = lastCols
+            .SelectMany(c => c.PalletIds).Select(ws.Pallet).Where(p => p is not null).Cast<SwPallet>()
+            .ToList();
+        if (lastPallets.Count < 2) return;
+
+        var keepCols = lastCols.ToHashSet();
+        var keepPlacements = ws.Placements.Where(x => keepCols.Any(c => c.Id == x.ColumnId)).ToList();
+        ws.Columns.RemoveAll(keepCols.Contains);
+        ws.Placements.RemoveAll(keepPlacements.Contains);
+
+        if (Needed(lastPallets, lastPallets.Count / 2, 1, last) > 1)
+        {
+            // Xếp lại không vừa 1 container (hiếm) -> giữ cách xếp chồng hết mức
+            ws.Columns.AddRange(lastCols);
+            ws.Placements.AddRange(keepPlacements);
+            ws.ContainerCount = last + 1;
+            return;
+        }
+
+        var firstNew = ws.Columns.Count;
+        BuildColumns(ws, lastPallets, FewestDoubles(lastPallets, 1, last), fitPairs);
+        Fill(ws, Order(ws, ws.Columns.Skip(firstNew)), 1, apply: true, last);
     }
 
     // Cọc đôi: trước hết các cặp vừa khít cột (bước 1); còn thiếu thì lấy từ các pallet thấp nhất,
     // ghép cao + thấp để cọc đôi cao gần nhau; pallet dưới phải đầy mặt; tổng cao ≤ lòng cont.
-    private static void BuildColumns(StowageWorkspace ws, int doublesNeeded, List<(SwPallet Bottom, SwPallet Top)> fitPairs)
+    private static void BuildColumns(StowageWorkspace ws, List<SwPallet> pallets, int doublesNeeded,
+        List<(SwPallet Bottom, SwPallet Top)> fitPairs)
     {
-        if (ws.Pallets.Count == 0) return;
+        if (pallets.Count == 0) return;
         if (ws.NoCombine) doublesNeeded = 0;
 
         // Cặp vừa khít cột: chồng đúng cặp (pallet dưới nhiều hơn 1 tầng)
         var paired = new HashSet<string>();
         foreach (var (bottom, top) in fitPairs
-                     .Where(x => ws.Pallets.Contains(x.Bottom) && ws.Pallets.Contains(x.Top))
+                     .Where(x => pallets.Contains(x.Bottom) && pallets.Contains(x.Top))
                      .OrderByDescending(x => ws.Layout(x.Bottom).Height + ws.Layout(x.Top).Height))
         {
             if (doublesNeeded <= 0) break;
@@ -399,7 +447,7 @@ public static class StowageAutoPlanner
             doublesNeeded--;
         }
 
-        var pool = ws.Pallets.Where(p => !paired.Contains(p.Id)).OrderByDescending(p => ws.Layout(p).Weight).ToList();
+        var pool = pallets.Where(p => !paired.Contains(p.Id)).OrderByDescending(p => ws.Layout(p).Weight).ToList();
         if (pool.Count == 0) return;
 
         // Cọc đôi lấy từ các pallet THẤP nhất (dễ vừa chiều cao lòng cont).
@@ -479,21 +527,23 @@ public static class StowageAutoPlanner
             return;
         }
 
-        var order = Order(ws);
+        var order = Order(ws, ws.Columns);
         var byWeight = (int)Math.Ceiling(order.Sum(ws.ColumnWeight) / Math.Max(1, ws.Spec.MaxPayload));
         var start = containers ?? Math.Max(Fill(ws, order, 1, apply: false), byWeight);   // Fill tự mở thêm / bỏ container trống
         Fill(ws, order, Math.Max(1, start), apply: true);
     }
 
     /// <summary>FCL: cọc cao trước (vào trong); AIR / LCL: cọc nặng trước.</summary>
-    private static List<SwColumn> Order(StowageWorkspace ws)
+    private static List<SwColumn> Order(StowageWorkspace ws, IEnumerable<SwColumn> columns)
         => ws.NoCombine
-            ? ws.Columns.OrderByDescending(ws.ColumnWeight).ToList()
-            : ws.Columns.OrderByDescending(ws.ColumnHeight).ThenByDescending(ws.ColumnWeight).ToList();
+            ? columns.OrderByDescending(ws.ColumnWeight).ToList()
+            : columns.OrderByDescending(ws.ColumnHeight).ThenByDescending(ws.ColumnWeight).ToList();
 
     /// <summary>Chia cọc thành hàng, dồn kín từng container theo thứ tự (container 1 đầy mới sang container 2);
-    /// mở sẵn <paramref name="start"/> container, thiếu chỗ thì mở thêm. Trả số container có hàng; apply = ghi vào workspace.</summary>
-    private static int Fill(StowageWorkspace ws, List<SwColumn> order, int start, bool apply)
+    /// mở sẵn <paramref name="start"/> container, thiếu chỗ thì mở thêm. Trả số container có hàng; apply = ghi vào workspace.
+    /// <paramref name="offset"/> = số thứ tự container đầu tiên (xếp riêng container cuối).
+    /// Cọc đầu hàng đợi không vừa phần còn lại thì lấp bằng cọc nhỏ hơn phía sau trước khi sang container mới.</summary>
+    private static int Fill(StowageWorkspace ws, List<SwColumn> order, int start, bool apply, int offset = 0)
     {
         double maxLen = ws.Spec.InnerLength, maxKg = ws.Spec.MaxPayload;
         var used = new List<double>();
@@ -552,23 +602,27 @@ public static class StowageAutoPlanner
                 }
             }
 
-            // 1 cọc (xoay cho vừa phần dư sát cửa)
-            var (depth, rot) = BestSingle(ws, a);
-            var ts = Target(depth, wa);
-            if (ts >= 0)
+            // 1 cọc (xoay cho vừa phần dư sát cửa); không vừa thì lấp bằng cọc phía sau vừa phần còn lại
+            var idx = -1;
+            for (var j = 0; j < queue.Count && idx < 0; j++)
+                if (Target(BestSingle(ws, queue[j]).Depth, ws.ColumnWeight(queue[j])) >= 0) idx = j;
+            if (idx >= 0)
             {
-                var lw = laneW[ts];
+                var one = queue[idx];
+                var wc = ws.ColumnWeight(one);
+                var (depth, rot) = BestSingle(ws, one);
+                var lw = laneW[cur];
                 var lane = Array.IndexOf(lw, lw.Min());
-                Put(ts, a, lane, rot);
-                lw[lane] += wa;
-                used[ts] += depth;
-                load[ts] += wa;
-                rows[ts]++;
-                queue.RemoveAt(0);
+                Put(cur, one, lane, rot);
+                lw[lane] += wc;
+                used[cur] += depth;
+                load[cur] += wc;
+                rows[cur]++;
+                queue.RemoveAt(idx);
                 continue;
             }
 
-            // Container đang xếp hết chỗ (cả 1 cọc cũng không vừa) -> sang container tiếp theo
+            // Container đang xếp hết chỗ (không cọc nào còn vừa) -> sang container tiếp theo
             if (used[cur] == 0) { queue.RemoveAt(0); continue; }     // cọc không vừa cả container trống: để ở khay
             cur++;
             if (cur == used.Count) Open();
@@ -578,7 +632,8 @@ public static class StowageAutoPlanner
         var count = placements.Count == 0 ? 1 : placements.Max(x => x.ContainerIndex) + 1;
         if (apply)
         {
-            ws.ContainerCount = count;
+            foreach (var x in placements) x.ContainerIndex += offset;
+            ws.ContainerCount = offset + count;
             ws.Placements.AddRange(placements);
         }
         return count;
