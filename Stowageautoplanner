@@ -20,8 +20,8 @@ namespace Swms.FinishGoods.Web.Features.StowagePlan.Business;
 ///     cả 2 đều đầy mặt thì pallet nặng hơn xuống dưới; tổng cao vừa lòng cont.
 ///     AIR/LCL không combine.
 ///   • Container: hàng sâu theo cọc (xoay ngang / dọc tuỳ ý, slip sheet / thùng rời theo mặt hộp), xếp tới tận cửa;
-///     FCL cọc cao vào trong, thấp ra cửa; số container = max(theo chiều dài sàn, theo tải trọng),
-///     hàng chia đều cho các container; cân trái / phải theo khối lượng.
+///     FCL cọc cao vào trong, thấp ra cửa; DỒN KÍN container 1 (tới cửa / đủ tải) rồi mới sang container 2;
+///     cân trái / phải theo khối lượng.
 /// Người dùng chỉnh tay tiếp ở 3 tab sau khi chạy.
 /// </summary>
 public static class StowageAutoPlanner
@@ -412,9 +412,9 @@ public static class StowageAutoPlanner
     //     AIR / LCL (không chồng): cọc nặng trước.
     //   • Mỗi hàng: thử ghép 2 cọc kế nhau (chọn hướng cho hàng nông nhất mà vừa bề ngang);
     //     hết chỗ cho cả hàng đôi thì đặt 1 cọc (xoay cho vừa phần dư sát cửa).
-    //   • Nhiều container: lần 1 xếp nối tiếp để biết số container tối thiểu (và theo tải trọng),
-    //     lần 2 chia hàng vào container đang ngắn nhất -> các container dài / tải gần bằng nhau,
-    //     container nào cũng cao ở trong, thấp ở cửa.
+    //   • Nhiều container: DỒN HẾT container đang xếp (tới cửa hoặc đủ tải trọng / số hàng) rồi mới sang
+    //     container tiếp theo -> container cuối chỉ chứa phần còn lại. Hàng đôi không vừa phần dư sát cửa
+    //     thì thử 1 cọc (xoay) để lấp nốt trước khi sang container mới.
     //   • Trong 1 container: cọc nặng hơn vào làn đang nhẹ hơn (cân trái / phải).
     private static void PlaceColumns(StowageWorkspace ws, int? containers)
     {
@@ -426,7 +426,7 @@ public static class StowageAutoPlanner
 
         var order = Order(ws);
         var byWeight = (int)Math.Ceiling(order.Sum(ws.ColumnWeight) / Math.Max(1, ws.Spec.MaxPayload));
-        var start = containers ?? Math.Max(Fill(ws, order, 1, apply: false), byWeight);
+        var start = containers ?? Math.Max(Fill(ws, order, 1, apply: false), byWeight);   // Fill tự mở thêm / bỏ container trống
         Fill(ws, order, Math.Max(1, start), apply: true);
     }
 
@@ -436,8 +436,8 @@ public static class StowageAutoPlanner
             ? ws.Columns.OrderByDescending(ws.ColumnWeight).ToList()
             : ws.Columns.OrderByDescending(ws.ColumnHeight).ThenByDescending(ws.ColumnWeight).ToList();
 
-    /// <summary>Chia cọc thành hàng và đặt vào <paramref name="start"/> container (thiếu chỗ thì mở thêm).
-    /// Trả số container đã dùng; apply = ghi vào workspace.</summary>
+    /// <summary>Chia cọc thành hàng, dồn kín từng container theo thứ tự (container 1 đầy mới sang container 2);
+    /// mở sẵn <paramref name="start"/> container, thiếu chỗ thì mở thêm. Trả số container có hàng; apply = ghi vào workspace.</summary>
     private static int Fill(StowageWorkspace ws, List<SwColumn> order, int start, bool apply)
     {
         double maxLen = ws.Spec.InnerLength, maxKg = ws.Spec.MaxPayload;
@@ -458,11 +458,12 @@ public static class StowageAutoPlanner
         void Put(int ci, SwColumn c, int lane, bool rot)
             => placements.Add(new SwPlacement { ContainerIndex = ci, Row = rows[ci], Lane = lane, ColumnId = c.Id, Rotated = rot });
 
-        int Target(double depth, double kg) => Enumerable.Range(0, used.Count)
-            .Where(i => used[i] + depth <= maxLen + 0.5 && rows[i] < StowageWorkspace.MaxRowIndex
-                        && (load[i] + kg <= maxKg || used[i] == 0))
-            .OrderBy(i => used[i]).ThenBy(i => load[i])
-            .DefaultIfEmpty(-1).First();
+        // Container đang xếp: chỉ sang container sau khi container này không nhận thêm được cọc nào
+        var cur = 0;
+        int Target(double depth, double kg)
+            => used[cur] + depth <= maxLen + 0.5 && rows[cur] < StowageWorkspace.MaxRowIndex
+               && (load[cur] + kg <= maxKg || used[cur] == 0)
+                ? cur : -1;
 
         var queue = new List<SwColumn>(order);
         var guard = 0;
@@ -512,15 +513,20 @@ public static class StowageAutoPlanner
                 continue;
             }
 
-            Open();     // không còn chỗ ở container nào -> mở container mới
+            // Container đang xếp hết chỗ (cả 1 cọc cũng không vừa) -> sang container tiếp theo
+            if (used[cur] == 0) { queue.RemoveAt(0); continue; }     // cọc không vừa cả container trống: để ở khay
+            cur++;
+            if (cur == used.Count) Open();
         }
 
+        // Số container = container cuối có hàng (container mở sẵn mà không dùng thì bỏ)
+        var count = placements.Count == 0 ? 1 : placements.Max(x => x.ContainerIndex) + 1;
         if (apply)
         {
-            ws.ContainerCount = used.Count;
+            ws.ContainerCount = count;
             ws.Placements.AddRange(placements);
         }
-        return used.Count;
+        return count;
     }
 
     /// <summary>Hướng đặt 2 cọc cạnh nhau cho hàng nông nhất mà tổng bề ngang vừa lòng cont; không vừa -> null.</summary>
