@@ -1,0 +1,994 @@
+using System.Globalization;
+
+namespace Swms.FinishGoods.Web.Features.StowagePlan.Business.Models;
+
+// ── Mô hình làm việc client-side của màn Stowage Plan ─────────
+// Giống "danh sách sẽ in" của Part Card: mọi thao tác soạn pallet / ghép cọc /
+// xếp container chạy trong bộ nhớ, chỉ gọi API khi tải plan và khi "Lưu sơ đồ".
+// Logic nằm ở đây (không nằm trong page) để page chỉ lo hiển thị + sự kiện.
+
+public sealed class SwBox
+{
+    public string BoxNo { get; init; } = "";
+    public string SiNo { get; init; } = "";
+    public string Model { get; init; } = "";
+    public double L { get; init; }
+    public double W { get; init; }
+    public double H { get; init; }
+    public double Weight { get; init; }
+    public string Color { get; init; } = "#B8C4D6";
+    /// <summary>Tối đa số tầng / pallet của model (null = theo chiều cao).</summary>
+    public int? LayerLimit { get; init; }
+    /// <summary>Thùng dự kiến (chưa lấy hàng) — tính từ số lượng / standard packing.</summary>
+    public bool IsEstimated { get; init; }
+
+    /// <summary>Mã rút gọn cho chip: bỏ tiền tố trước dấu '-' đầu (NN-ST65JB → ST65JB).</summary>
+    public string ShortModel
+    {
+        get
+        {
+            var i = Model.IndexOf('-');
+            return i > 0 && i < Model.Length - 1 ? Model[(i + 1)..] : Model;
+        }
+    }
+
+    public string Dims => $"{StowageWorkspace.N(L)}×{StowageWorkspace.N(W)}×{StowageWorkspace.N(H)}cm";
+}
+
+public sealed class SwPallet
+{
+    public string Id { get; set; } = "";
+    public string Code { get; set; } = "";
+    public string SiNo { get; set; } = "";
+    public string Size { get; set; } = "S1210";
+    public int Length { get; set; } = 120;
+    public int Width { get; set; } = 100;
+    public List<string> BoxNos { get; set; } = new();
+}
+
+public sealed class SwColumn
+{
+    public string Id { get; set; } = "";
+    public string Code { get; set; } = "";
+    public string? Bottom { get; set; }
+    public string? Top { get; set; }
+
+    public IEnumerable<string> PalletIds
+    {
+        get
+        {
+            if (Bottom is not null) yield return Bottom;
+            if (Top is not null) yield return Top;
+        }
+    }
+
+    public int Count => (Bottom is null ? 0 : 1) + (Top is null ? 0 : 1);
+}
+
+public sealed class SwPlacement
+{
+    public int ContainerIndex { get; set; }
+    public int Row { get; set; }
+    public int Lane { get; set; }
+    public string ColumnId { get; set; } = "";
+    /// <summary>true = xoay ngang: cạnh rộng của pallet nằm dọc container (mặc định cạnh dài nằm dọc).</summary>
+    public bool Rotated { get; set; }
+}
+
+/// <summary>Vị trí 1 box trên pallet (cm, gốc = góc trái-sau mặt pallet).</summary>
+public readonly record struct PlacedBox(double X, double Y, double Z, double L, double W, double H, SwBox Box);
+
+/// <param name="PartialLayers">Số tầng chưa đầy. Chỉ được 1 và phải là tầng trên cùng —
+/// &gt; 1 nghĩa là có tầng chưa đầy bị chồng lên (sai quy tắc xếp).</param>
+/// <param name="FootL">Mặt bằng chiếm sàn (cm) theo chiều dài pallet. Pallet có đế = cỡ đế;
+/// slip sheet / thùng rời (không có đế cứng) = mặt khối thùng.</param>
+/// <param name="FootW">Mặt bằng chiếm sàn (cm) theo chiều rộng pallet.</param>
+public sealed record PalletLayout(IReadOnlyList<PlacedBox> Boxes, int Layers, double Height, double Weight,
+    int PartialLayers = 0, double FootL = 120, double FootW = 100)
+{
+    /// <summary>Mặt trên đầy (không có tầng thiếu) — điều kiện để làm pallet đáy của cọc đôi.</summary>
+    public bool FullTop => PartialLayers == 0;
+}
+
+/// <summary>Cảnh báo / lỗi. Level: bad | warn | info. Key là key localization.</summary>
+public sealed class StowFlag
+{
+    public StowFlag(string level, string key, params object[] args)
+    {
+        Level = level;
+        Key = key;
+        Args = args;
+    }
+
+    public string Level { get; }
+    public string Key { get; }
+    public object[] Args { get; }
+}
+
+public sealed record ContainerMetric(
+    double Weight, double[] LaneWeight, double FrontWeight, double BackWeight,
+    int ColumnCount, int RowsUsed, double FreeLength);
+
+public sealed class StowageWorkspace
+{
+    public const int PalletPitch = 120;   // 1 vị trí pallet theo chiều dài container (cm)
+    public const int LanePitch = 100;     // 1 làn pallet theo chiều ngang container (cm)
+
+    private static readonly string[] SiPalette =
+        { "#2563EB", "#7C3AED", "#0D9488", "#D97706", "#DB2777", "#65A30D", "#0891B2", "#DC2626" };
+
+    // Mỗi model 1 màu, khác hẳn nhau (gán theo thứ tự model trong plan -> không trùng màu như khi băm mã).
+    private static readonly string[] ModelPalette =
+        { "#F4A261", "#6FA8DC", "#8BC34A", "#E57373", "#BA68C8", "#FFD54F", "#4DB6AC", "#F06292",
+          "#A1887F", "#90A4AE", "#AED581", "#7986CB", "#FF8A65", "#4FC3F7", "#DCE775", "#CE93D8" };
+
+    // ── Thông tin plan ───────────────────────────────────────
+    public string PlanNo { get; private init; } = "";
+    public string? TripNo { get; private init; }
+    public string UnitKind { get; private init; } = "CONT";
+    public string UnitNo { get; private init; } = "";
+    public string ContainerType { get; private init; } = "";
+    public string Destination { get; private init; } = "";
+    public DateTime? Etd { get; private init; }
+    public string Forwarder { get; private init; } = "";
+    public string Mode { get; private init; } = "FCL";
+    public StowageStatus Status { get; private init; }
+    public ContainerSpec Spec { get; private init; } = ContainerSpec.Of(null);
+
+    private PalletBaseType _baseType = PalletBaseType.NoBase;
+    public PalletBaseType BaseType
+    {
+        get => _baseType;
+        set
+        {
+            if (_baseType == value) return;
+            _baseType = value;
+            Commit();
+        }
+    }
+
+    public int ContainerCount { get; set; } = 1;
+    public bool Dirty { get; private set; }
+
+    public List<StowageSiDto> Sis { get; } = new();
+    public Dictionary<string, SwBox> Boxes { get; } = new(StringComparer.OrdinalIgnoreCase);
+    public List<SwPallet> Pallets { get; } = new();
+    public List<SwColumn> Columns { get; } = new();
+    public List<SwPlacement> Placements { get; } = new();
+
+    private readonly Dictionary<string, PalletLayout> _layouts = new();
+
+    // ── Quy tắc ──────────────────────────────────────────────
+    /// <summary>AIR / LCL không combine (không chồng 2 pallet).</summary>
+    public bool NoCombine => Mode is "AIR" or "LCL";
+
+    /// <summary>Cao tối đa 1 pallet (gồm đế): AIR 140, LCL 160, FCL = nửa chiều cao lòng cont.</summary>
+    public double MaxPalletHeight => Mode switch
+    {
+        "AIR" => 140,
+        "LCL" => 160,
+        _ => Math.Floor(Spec.InnerHeight / 2.0),
+    };
+
+    /// <summary>Giới hạn chặn 1 pallet: AIR / LCL = <see cref="MaxPalletHeight"/>; FCL = lòng cont
+    /// (pallet dưới của cọc vừa khít được cao hơn ½ cont, VD 3 tầng + 2 tầng).</summary>
+    public double PalletHardLimit => NoCombine ? MaxPalletHeight : Spec.InnerHeight;
+
+    /// <summary>Cọc tính vừa khít tới đúng chiều cao lòng cont (gồm đế); cao hơn mức này thì cảnh báo (40HC: 252).</summary>
+    public double ColumnWarnHeight => Spec.InnerHeight - 1;
+
+    // ── Đế pallet: theo packing type của SI (mỗi pallet 1 SI -> đế theo SI của pallet) ──
+    /// <summary>Cao đế (cm). Paper pallet 13 cm (master PSNV: 125×100, 113×94, 106×104 — cùng cao 13).</summary>
+    public static double BaseHeightOf(PalletBaseType t) => t switch
+    {
+        PalletBaseType.Wood => 14,
+        PalletBaseType.Plastic => 15,
+        PalletBaseType.Paper => 13,
+        PalletBaseType.NoBase => 1,     // tấm lót (slip sheet)
+        _ => 0,                         // thùng rời
+    };
+
+    /// <summary>Nặng đế (kg). Paper pallet: ước tính 5 kg.</summary>
+    public static double BaseWeightOf(PalletBaseType t) => t switch
+    {
+        PalletBaseType.Wood => 20,
+        PalletBaseType.Plastic => 12,
+        PalletBaseType.Paper => 5,
+        _ => 0,
+    };
+
+    /// <summary>Loại đế của SI (theo packing type); SI không ghi -> đế chung của plan.</summary>
+    public PalletBaseType BaseOfSi(string? siNo)
+        => Sis.FirstOrDefault(s => Same(s.SiNo, siNo))?.BaseType ?? BaseType;
+
+    public PalletBaseType BaseOf(SwPallet p) => BaseOfSi(p.SiNo);
+
+    /// <summary>Chữ hiển thị trên thẻ pallet: đúng packing type của SI (vd "PLASTIC PALLET").</summary>
+    public string? PackingOf(SwPallet p) => Sis.FirstOrDefault(s => Same(s.SiNo, p.SiNo))?.PackingType;
+
+    public double BaseHeight => BaseHeightOf(BaseType);
+    public double BaseWeight => BaseWeightOf(BaseType);
+
+    /// <summary>Số hàng nếu mọi cọc là pallet 120×100 đặt dọc — chỉ để tham khảo.
+    /// Sàn thật: hàng sâu theo cọc trong hàng (xoay ngang / dọc, slip sheet theo mặt hộp), xếp tới cửa (FloorRows).</summary>
+    public int Rows => Math.Max(1, Spec.InnerLength / PalletPitch);
+    public int Lanes => Math.Max(1, Spec.InnerWidth / LanePitch);
+
+    /// <summary>Số ô ước tính / container theo mặt bằng pallet phổ biến nhất của plan (xoay tối ưu, tới tận cửa).</summary>
+    public int SlotsPerContainer
+    {
+        get
+        {
+            var feet = Pallets.Select(p => Layout(p)).Select(l => (Math.Round(l.FootL), Math.Round(l.FootW))).ToList();
+            var (fl, fw) = feet.Count == 0 ? ((double)PalletPitch, (double)LanePitch)
+                : feet.GroupBy(f => f).OrderByDescending(g => g.Count()).First().Key;
+            return EstimateSlots(fl, fw);
+        }
+    }
+
+    /// <summary>Số pallet cùng mặt bằng (fl × fw) xếp được trên 1 sàn: các hàng cùng hướng,
+    /// phần dư sát cửa thêm 1 hàng hướng kia nếu vừa.</summary>
+    public int EstimateSlots(double fl, double fw)
+    {
+        double L = Spec.InnerLength, W = Spec.InnerWidth;
+        var best = 0;
+        foreach (var (d, sp) in new[] { (fl, fw), (fw, fl) })
+        {
+            var perRow = Math.Min(Lanes, Math.Max(0, (int)(W / Math.Max(1, sp))));
+            if (perRow == 0) continue;
+            var rows = (int)(L / Math.Max(1, d));
+            var n = rows * perRow;
+            var rest = L - rows * d;
+            if (rest >= sp && d <= W) n += Math.Min(Lanes, (int)(W / Math.Max(1, d)));   // hàng cuối xoay
+            best = Math.Max(best, n);
+        }
+        return Math.Max(1, best);
+    }
+
+    // ── Dựng từ DTO / xuất request ───────────────────────────
+    public static StowageWorkspace FromDto(StowagePlanDto d)
+    {
+        var ws = new StowageWorkspace
+        {
+            PlanNo = d.PlanNo,
+            TripNo = d.TripNo,
+            UnitKind = string.IsNullOrWhiteSpace(d.UnitKind) ? "CONT" : d.UnitKind,
+            UnitNo = d.UnitNo,
+            ContainerType = d.ContainerType,
+            Destination = d.Destination,
+            Etd = d.Etd,
+            Forwarder = d.Forwarder ?? "",
+            Mode = (d.Mode ?? "FCL").Trim().ToUpperInvariant(),
+            Status = d.Status,
+            Spec = ContainerSpec.Of(d.ContainerType),
+        };
+        ws._baseType = d.BaseType;
+        ws.ContainerCount = Math.Max(1, d.ContainerCount);
+
+        foreach (var s in d.Sis)
+            ws.Sis.Add(new StowageSiDto
+            {
+                SiNo = s.SiNo,
+                Customer = s.Customer,
+                Color = s.Color,
+                PackingType = s.PackingType,
+                BaseType = s.BaseType,
+            });
+
+        // Màu model: theo thứ tự model (A→Z) trong plan, mỗi model 1 màu riêng
+        var modelColors = d.Boxes.Select(b => b.Model).Distinct(StringComparer.OrdinalIgnoreCase)
+            .OrderBy(m => m, StringComparer.OrdinalIgnoreCase)
+            .Select((m, i) => (m, c: ModelPalette[i % ModelPalette.Length]))
+            .ToDictionary(x => x.m, x => x.c, StringComparer.OrdinalIgnoreCase);
+
+        foreach (var b in d.Boxes.Where(b => !string.IsNullOrWhiteSpace(b.BoxNo)))
+        {
+            ws.Boxes[b.BoxNo] = new SwBox
+            {
+                BoxNo = b.BoxNo,
+                SiNo = b.SiNo,
+                Model = b.Model,
+                L = b.Length,
+                W = b.Width,
+                H = b.Height,
+                Weight = b.Weight,
+                Color = IsHex(b.Color) ? b.Color! : modelColors.GetValueOrDefault(b.Model, ModelPalette[0]),
+                LayerLimit = b.LayerLimit is > 0 ? b.LayerLimit : null,
+                IsEstimated = b.IsEstimated,
+            };
+        }
+
+        // SI có box nhưng thiếu trong danh sách SI → vẫn hiển thị.
+        foreach (var si in ws.Boxes.Values.Select(b => b.SiNo).Distinct(StringComparer.OrdinalIgnoreCase))
+            if (!ws.Sis.Any(s => Same(s.SiNo, si)))
+                ws.Sis.Add(new StowageSiDto { SiNo = si });
+
+        for (var i = 0; i < ws.Sis.Count; i++)
+            if (!IsHex(ws.Sis[i].Color)) ws.Sis[i].Color = SiPalette[i % SiPalette.Length];
+
+        foreach (var p in d.Pallets)
+        {
+            // Slip sheet / thùng rời: cỡ lưu trong DB là mặt hộp -> khi soạn lại vẫn chia lưới theo 120×100
+            var soft = IsSoftBase(ws.BaseOfSi(p.SiNo));
+            ws.Pallets.Add(new SwPallet
+            {
+                Id = string.IsNullOrWhiteSpace(p.PalletNo) ? NewId("TMP-PLT") : p.PalletNo,
+                Code = p.Code,
+                SiNo = p.SiNo,
+                Size = string.IsNullOrWhiteSpace(p.Size) ? "S1210" : p.Size,
+                Length = soft || p.PalletLength <= 0 ? 120 : p.PalletLength,
+                Width = soft || p.PalletWidth <= 0 ? 100 : p.PalletWidth,
+                BoxNos = p.BoxNos.ToList(),
+            });
+        }
+
+        foreach (var c in d.Columns)
+        {
+            ws.Columns.Add(new SwColumn
+            {
+                Id = string.IsNullOrWhiteSpace(c.ColumnNo) ? NewId("TMP-COL") : c.ColumnNo,
+                Code = c.Code,
+                Bottom = c.BottomPalletNo,
+                Top = c.TopPalletNo,
+            });
+        }
+
+        foreach (var x in d.Placements)
+        {
+            ws.Placements.Add(new SwPlacement
+            {
+                ContainerIndex = x.ContainerIndex,
+                Row = x.Row,
+                Lane = x.Lane,
+                ColumnId = x.ColumnNo,
+                Rotated = x.Rotated,
+            });
+        }
+
+        if (ws.Placements.Count > 0)
+            ws.ContainerCount = Math.Max(ws.ContainerCount, ws.Placements.Max(x => x.ContainerIndex) + 1);
+
+        ws.Normalize();
+        ws.Dirty = false;
+        return ws;
+    }
+
+    public SaveStowagePlanRequest ToRequest() => new()
+    {
+        BaseType = BaseType,
+        ContainerCount = ContainerCount,
+        Complete = AllPlaced,
+        // Cỡ gửi API = mặt bằng chiếm sàn (slip sheet / thùng rời = mặt hộp) -> server kiểm vừa sàn.
+        Pallets = Pallets.Select(p => new StowagePalletDto
+        {
+            PalletNo = p.Id,
+            Code = p.Code,
+            SiNo = p.SiNo,
+            Size = p.Size,
+            PalletLength = Math.Max(1, (int)Math.Ceiling(Layout(p).FootL - 0.01)),
+            PalletWidth = Math.Max(1, (int)Math.Ceiling(Layout(p).FootW - 0.01)),
+            BoxNos = p.BoxNos.ToList(),
+        }).ToList(),
+        Columns = Columns.Select(c => new StowageColumnDto
+        {
+            ColumnNo = c.Id,
+            Code = c.Code,
+            BottomPalletNo = c.Bottom,
+            TopPalletNo = c.Top,
+        }).ToList(),
+        Placements = Placements.Select(x => new StowagePlacementDto
+        {
+            ContainerIndex = x.ContainerIndex,
+            Row = x.Row,
+            Lane = x.Lane,
+            ColumnNo = x.ColumnId,
+            Rotated = x.Rotated,
+        }).ToList(),
+    };
+
+    // ── Tra cứu ──────────────────────────────────────────────
+    public SwPallet? Pallet(string? id) => id is null ? null : Pallets.FirstOrDefault(p => p.Id == id);
+    public SwColumn? Column(string? id) => id is null ? null : Columns.FirstOrDefault(c => c.Id == id);
+
+    public SwPallet? PalletOfBox(string boxNo)
+        => Pallets.FirstOrDefault(p => p.BoxNos.Contains(boxNo, StringComparer.OrdinalIgnoreCase));
+
+    public SwColumn? ColumnOfPallet(string palletId)
+        => Columns.FirstOrDefault(c => c.Bottom == palletId || c.Top == palletId);
+
+    public SwPlacement? PlacementOf(string columnId) => Placements.FirstOrDefault(x => x.ColumnId == columnId);
+
+    public SwPlacement? SlotAt(int ci, int row, int lane)
+        => Placements.FirstOrDefault(x => x.ContainerIndex == ci && x.Row == row && x.Lane == lane);
+
+    public IEnumerable<SwPallet> PalletsOf(string siNo)
+        => Pallets.Where(p => Same(p.SiNo, siNo)).OrderBy(p => CodeNum(p.Code)).ThenBy(p => p.Code);
+
+    public IEnumerable<SwBox> BoxesOf(SwPallet p)
+        => p.BoxNos.Select(b => Boxes.GetValueOrDefault(b)).Where(b => b is not null).Cast<SwBox>();
+
+    public IEnumerable<SwColumn> UnplacedColumns
+        => Columns.Where(c => PlacementOf(c.Id) is null).OrderByDescending(ColumnWeight).ThenBy(c => c.Code);
+
+    public string SiColor(string? siNo)
+        => Sis.FirstOrDefault(s => Same(s.SiNo, siNo))?.Color ?? "#8A94A6";
+
+    public bool AllPlaced => Columns.Count > 0 && Columns.All(c => PlacementOf(c.Id) is not null);
+
+    /// <summary>Số thùng dự kiến (SI chưa lấy hàng) — hiện ghi chú trên màn hình.</summary>
+    public int EstimatedBoxCount => Boxes.Values.Count(b => b.IsEstimated);
+    public double TotalWeight => Pallets.Sum(p => Layout(p).Weight);
+
+    /// <summary>Số container cần: theo số vị trí và theo tải trọng, lấy lớn hơn.</summary>
+    public int ContainersNeeded => Math.Max(1, Math.Max(
+        (int)Math.Ceiling(Columns.Count / (double)SlotsPerContainer),
+        (int)Math.Ceiling(TotalWeight / Spec.MaxPayload)));
+
+    // ── Bố trí box trên pallet (để vẽ 3D + tính cao) ─────────
+    // Quy tắc xếp tầng:
+    //   • 1 tầng chỉ 1 cỡ thùng (cùng mặt đáy, xoay được) — nhiều model cùng cỡ thùng ghép chung 1 tầng được.
+    //   • Tầng phải ĐẦY (đủ 1 mặt) mới được chồng tầng khác lên → tầng đầy xếp trước (to / nặng ở dưới),
+    //     tầng thiếu để trên cùng. Tự động xếp chỉ gộp lẻ khi pallet còn tối đa 1 tầng thiếu (PartialLayers).
+    public PalletLayout Layout(SwPallet p)
+    {
+        if (_layouts.TryGetValue(p.Id, out var cached)) return cached;
+
+        // Nhóm theo cỡ thùng; nhóm to / nặng trước.
+        var groups = new List<List<SwBox>>();
+        foreach (var b in BoxesOf(p)
+                     .OrderByDescending(b => b.L * b.W)
+                     .ThenByDescending(b => b.Weight)
+                     .ThenBy(b => b.Model)
+                     .ThenBy(b => b.BoxNo))
+        {
+            var g = groups.FirstOrDefault(x => SameFootprint(x[0], b));
+            if (g is null) groups.Add(new List<SwBox> { b });
+            else g.Add(b);
+        }
+
+        // Cắt từng nhóm thành tầng theo sức chứa 1 mặt pallet.
+        var full = new List<List<SwBox>>();
+        var partial = new List<List<SwBox>>();
+        foreach (var g in groups)
+        {
+            var (nx, ny, _, _) = Grid(p.Length, p.Width, g[0].L, g[0].W);
+            var cap = Math.Max(1, nx * ny);
+            for (var i = 0; i < g.Count; i += cap)
+            {
+                var layer = g.Skip(i).Take(cap).ToList();
+                (layer.Count == cap ? full : partial).Add(layer);
+            }
+        }
+
+        var placed = new List<PlacedBox>();
+        var baseType = BaseOf(p);
+        var z = BaseHeightOf(baseType);
+        var layers = full.Concat(partial).ToList();
+        var grids = layers.Select(l => Grid(p.Length, p.Width, l[0].L, l[0].W)).ToList();
+
+        // Mặt bằng chiếm sàn: có đế cứng = cỡ đế; slip sheet / thùng rời = mặt khối thùng lớn nhất.
+        double footL = p.Length, footW = p.Width;
+        if (IsSoftBase(baseType) && grids.Count > 0)
+        {
+            footL = grids.Max(g => g.nx * g.bl);
+            footW = grids.Max(g => g.ny * g.bw);
+        }
+
+        for (var li = 0; li < layers.Count; li++)
+        {
+            var layer = layers[li];
+            var (nx, ny, bl, bw) = grids[li];
+            var ox = (footL - nx * bl) / 2;
+            var oy = (footW - ny * bw) / 2;
+            double layerH = 0;
+            for (var k = 0; k < layer.Count; k++)
+            {
+                var b = layer[k];
+                placed.Add(new PlacedBox(ox + (k % nx) * bl, oy + (k / nx) * bw, z, bl, bw, b.H, b));
+                layerH = Math.Max(layerH, b.H);
+            }
+            z += layerH;
+        }
+
+        var count = placed.Count;
+        var layout = new PalletLayout(
+            placed, full.Count + partial.Count,
+            count == 0 ? 0 : z,
+            placed.Sum(x => x.Box.Weight) + (count == 0 ? 0 : BaseWeightOf(baseType)),
+            partial.Count, footL, footW);
+
+        _layouts[p.Id] = layout;
+        return layout;
+    }
+
+    /// <summary>Số box / tầng của 1 loại thùng trên pallet chuẩn 120×100.</summary>
+    public static int PerLayer(SwBox b, int palletL = 120, int palletW = 100)
+    {
+        var (nx, ny, _, _) = Grid(palletL, palletW, b.L, b.W);
+        return nx * ny;
+    }
+
+    // Lưới xếp tốt hơn giữa 2 hướng xoay.
+    private static (int nx, int ny, double bl, double bw) Grid(double pl, double pw, double l, double w)
+    {
+        if (l <= 0 || w <= 0) return (1, 1, Math.Max(l, 1), Math.Max(w, 1));
+
+        int ax = (int)(pl / l), ay = (int)(pw / w);
+        int bx = (int)(pl / w), by = (int)(pw / l);
+
+        if (ax * ay == 0 && bx * by == 0) return (1, 1, l, w);
+        return bx * by > ax * ay ? (bx, by, w, l) : (ax, ay, l, w);
+    }
+
+    private static bool SameFootprint(SwBox a, SwBox b)
+    {
+        var (a1, a2) = (Math.Max(a.L, a.W), Math.Min(a.L, a.W));
+        var (b1, b2) = (Math.Max(b.L, b.W), Math.Min(b.L, b.W));
+        return Math.Abs(a1 - b1) < 0.5 && Math.Abs(a2 - b2) < 0.5;
+    }
+
+    /// <summary>Đế mềm / không đế (slip sheet, thùng rời): không có kích thước đế, chiếm sàn theo mặt hộp.</summary>
+    public static bool IsSoftBase(PalletBaseType t) => t is PalletBaseType.NoBase or PalletBaseType.Loose;
+
+    // ── Mặt bằng cọc trên sàn (xoay ngang / dọc tuỳ ý) ───────
+    /// <summary>Mặt bằng cọc (cm): lớn nhất giữa các pallet trong cọc, theo chiều dài / rộng pallet.</summary>
+    public (double L, double W) Footprint(SwColumn c)
+    {
+        var feet = c.PalletIds.Select(Pallet).Where(p => p is not null).Select(p => Layout(p!)).ToList();
+        return feet.Count == 0 ? ((double)PalletPitch, (double)LanePitch) : (feet.Max(f => f.FootL), feet.Max(f => f.FootW));
+    }
+
+    /// <summary>Chiếm dọc container (Depth) / ngang container (Span) theo hướng đặt.</summary>
+    public (double Depth, double Span) Extent(SwColumn c, bool rotated)
+    {
+        var (l, w) = Footprint(c);
+        return rotated ? (w, l) : (l, w);
+    }
+
+    public const int MaxRowIndex = 60;
+
+    private IEnumerable<SwPlacement> In(int ci) => Placements.Where(x => x.ContainerIndex == ci);
+
+    private (double Depth, double Span) ExtentOf(SwPlacement x)
+        => Column(x.ColumnId) is { } c ? Extent(c, x.Rotated) : (0d, 0d);
+
+    /// <summary>Độ sâu 1 hàng = cọc sâu nhất trong hàng (0 nếu hàng trống).</summary>
+    public double RowDepth(int ci, int row)
+        => In(ci).Where(x => x.Row == row).Select(x => ExtentOf(x).Depth).DefaultIfEmpty(0).Max();
+
+    /// <summary>Khoảng cách từ đầu container (mũi) tới mép trước của hàng.</summary>
+    public double RowOffset(int ci, int row)
+        => In(ci).Where(x => x.Row < row).GroupBy(x => x.Row).Sum(g => g.Max(x => ExtentOf(x).Depth));
+
+    /// <summary>Chiều dài sàn đã dùng (tổng độ sâu các hàng).</summary>
+    public double UsedLength(int ci)
+        => In(ci).GroupBy(x => x.Row).Sum(g => g.Max(x => ExtentOf(x).Depth));
+
+    /// <summary>Vị trí ngang của cọc: làn đầu sát vách trái, làn cuối sát vách phải, làn giữa nối tiếp.</summary>
+    public double LaneY(SwPlacement x)
+    {
+        var span = ExtentOf(x).Span;
+        if (Lanes > 1 && x.Lane == Lanes - 1) return Math.Max(0, Spec.InnerWidth - span);
+        return In(x.ContainerIndex).Where(o => o.Row == x.Row && o.Lane < x.Lane).Sum(o => ExtentOf(o).Span);
+    }
+
+    /// <summary>Container vừa: mỗi hàng tổng bề ngang ≤ lòng cont, tổng độ sâu các hàng ≤ chiều dài cont.</summary>
+    public bool ContainerFits(int ci)
+    {
+        if (UsedLength(ci) > Spec.InnerLength + 0.5) return false;
+        return In(ci).GroupBy(x => x.Row).All(g => g.Sum(x => ExtentOf(x).Span) <= Spec.InnerWidth + 0.5);
+    }
+
+    /// <summary>Số hàng hiện trên sơ đồ sàn: các hàng đã dùng + số hàng còn đặt thêm được tới tận cửa.</summary>
+    public int FloorRows(int ci)
+    {
+        var maxRow = In(ci).Select(x => x.Row).DefaultIfEmpty(-1).Max();
+        var minDepth = Columns.Select(c => Footprint(c)).Select(f => Math.Min(f.L, f.W)).DefaultIfEmpty(LanePitch).Min();
+        var free = Spec.InnerLength - UsedLength(ci);
+        var extra = minDepth > 0 ? (int)(free / minDepth) : 0;
+        return Math.Clamp(maxRow + 1 + Math.Max(0, extra), 1, MaxRowIndex);
+    }
+
+    public double ColumnHeight(SwColumn c) => c.PalletIds.Select(Pallet).Where(p => p is not null).Sum(p => Layout(p!).Height);
+    public double ColumnWeight(SwColumn c) => c.PalletIds.Select(Pallet).Where(p => p is not null).Sum(p => Layout(p!).Weight);
+
+    // ── Cảnh báo ─────────────────────────────────────────────
+    public IEnumerable<StowFlag> PalletFlags(SwPallet p)
+    {
+        var lay = Layout(p);
+        if (lay.Height > PalletHardLimit + 0.01)
+            yield return new("bad", "StowagePlan.Flag.PalletOverHeight", N(lay.Height), N(PalletHardLimit));
+        else if (!NoCombine && lay.Height < MaxPalletHeight * 0.75)
+            yield return new("warn", "StowagePlan.Flag.Partial");
+
+        var models = BoxesOf(p).Select(b => b.Model).Distinct().Count();
+        if (models > 1) yield return new("info", "StowagePlan.Flag.MixedModel", models);
+    }
+
+    public IEnumerable<StowFlag> ColumnFlags(SwColumn c)
+    {
+        var h = ColumnHeight(c);
+        if (h > Spec.InnerHeight + 0.01)
+            yield return new("bad", "StowagePlan.Flag.ColumnOverHeight", N(h), Spec.InnerHeight);
+        else if (h > ColumnWarnHeight + 0.01)
+            yield return new("warn", "StowagePlan.Flag.ColumnOverHeight", N(h), N(ColumnWarnHeight));      // vừa khít: còn < 1 cm
+
+        if (c.Top is null) yield break;
+
+        if (NoCombine) yield return new("bad", "StowagePlan.Flag.NoCombine", Mode);
+
+        var top = Pallet(c.Top);
+        var bottom = Pallet(c.Bottom);
+        if (top is null || bottom is null) yield break;
+
+        if (Layout(top).Weight > Layout(bottom).Weight)
+            yield return new("warn", "StowagePlan.Flag.HeavyOnTop");
+        if (!Same(top.SiNo, bottom.SiNo))
+            yield return new("info", "StowagePlan.Flag.MixSi");
+    }
+
+    /// <summary>Lỗi chặn lưu, kèm mã pallet / cọc để báo cho người dùng.</summary>
+    public IEnumerable<(string Code, StowFlag Flag)> BlockingIssues()
+        => Pallets.SelectMany(p => PalletFlags(p).Select(f => (p.Code, f)))
+            .Concat(Columns.SelectMany(c => ColumnFlags(c).Select(f => (c.Code, f))))
+            .Where(x => x.f.Level == "bad");
+
+    // ── Thao tác: soạn pallet ────────────────────────────────
+    /// <summary>Chuyển box sang pallet đích (1 SI / pallet). Trả về key lỗi hoặc null.</summary>
+    public string? MoveBoxes(IReadOnlyCollection<string> boxNos, string targetPalletId)
+    {
+        var target = Pallet(targetPalletId);
+        if (target is null) return "StowagePlan.Err.PalletNotFound";
+
+        var boxes = boxNos.Where(Boxes.ContainsKey).Distinct(StringComparer.OrdinalIgnoreCase).ToList();
+        if (boxes.Count == 0) return null;
+        if (boxes.Any(b => !Same(Boxes[b].SiNo, target.SiNo))) return "StowagePlan.Err.OneSiPerPallet";
+
+        foreach (var p in Pallets.Where(p => p != target))
+            p.BoxNos.RemoveAll(b => boxes.Contains(b, StringComparer.OrdinalIgnoreCase));
+        foreach (var b in boxes.Where(b => !target.BoxNos.Contains(b, StringComparer.OrdinalIgnoreCase)))
+            target.BoxNos.Add(b);
+
+        Commit();
+        return null;
+    }
+
+    /// <summary>Tách box ra pallet mới (cùng SI).</summary>
+    public string? SplitToNewPallet(IReadOnlyCollection<string> boxNos)
+    {
+        var boxes = boxNos.Where(Boxes.ContainsKey).ToList();
+        if (boxes.Count == 0) return null;
+
+        var si = Boxes[boxes[0]].SiNo;
+        if (boxes.Any(b => !Same(Boxes[b].SiNo, si))) return "StowagePlan.Err.OneSiPerPallet";
+
+        var src = PalletOfBox(boxes[0]);
+        var p = new SwPallet
+        {
+            Id = NewId("TMP-PLT"),
+            Code = NextCode("P", Pallets.Select(x => x.Code)),
+            SiNo = si,
+            Size = src?.Size ?? "S1210",
+            Length = src?.Length ?? 120,
+            Width = src?.Width ?? 100,
+        };
+        Pallets.Add(p);
+        return MoveBoxes(boxes, p.Id);
+    }
+
+    // ── Thao tác: ghép cọc ───────────────────────────────────
+    public string? CanDropPallet(string palletId, string columnId)
+    {
+        var col = Column(columnId);
+        var pallet = Pallet(palletId);
+        if (col is null || pallet is null) return "StowagePlan.Err.PalletNotFound";
+        if (col.PalletIds.Contains(palletId)) return null;
+        if (NoCombine) return "StowagePlan.Err.NoCombine";
+        if (col.Count >= 2) return "StowagePlan.Err.ColumnFull";
+        if (ColumnHeight(col) + Layout(pallet).Height > Spec.InnerHeight + 0.01) return "StowagePlan.Err.ColumnTooHigh";
+        // Chồng 2 pallet: pallet dưới phải đầy 1 mặt → ít nhất 1 trong 2 pallet phải đầy mặt trên.
+        var bottom = Pallet(col.Bottom);
+        if (bottom is not null && !Layout(bottom).FullTop && !Layout(pallet).FullTop) return "StowagePlan.Err.ColumnFull";
+        return null;
+    }
+
+    /// <summary>Đặt pallet lên cọc khác. Pallet đầy mặt trên làm đáy; cùng đầy thì pallet nặng hơn xuống dưới.</summary>
+    public string? MovePalletToColumn(string palletId, string columnId)
+    {
+        var err = CanDropPallet(palletId, columnId);
+        if (err is not null) return err;
+
+        var col = Column(columnId)!;
+        if (col.PalletIds.Contains(palletId)) return null;
+
+        var from = ColumnOfPallet(palletId);
+        if (from is not null)
+        {
+            if (from.Bottom == palletId) from.Bottom = null; else from.Top = null;
+        }
+
+        col.Top = palletId;
+        if (col.Bottom is not null)
+        {
+            var b = Layout(Pallet(col.Bottom)!);
+            var t = Layout(Pallet(col.Top)!);
+            if (!b.FullTop || (t.FullTop && t.Weight > b.Weight))
+                (col.Bottom, col.Top) = (col.Top, col.Bottom);
+        }
+
+        Commit();
+        return null;
+    }
+
+    /// <summary>Tách pallet khỏi cọc đôi thành cọc đơn mới.</summary>
+    public void SplitPalletToNewColumn(string palletId)
+    {
+        var from = ColumnOfPallet(palletId);
+        if (from is null || from.Count < 2) return;
+        if (from.Bottom == palletId) from.Bottom = null; else from.Top = null;
+        Commit();   // Normalize tạo cọc đơn cho pallet mồ côi
+    }
+
+    public void SwapColumn(string columnId)
+    {
+        var c = Column(columnId);
+        if (c is null || c.Count < 2) return;
+        var top = Pallet(c.Top);
+        if (top is null || !Layout(top).FullTop) return;   // pallet dưới phải đầy 1 mặt
+        (c.Bottom, c.Top) = (c.Top, c.Bottom);
+        Commit();
+    }
+
+    // ── Thao tác: xếp container ──────────────────────────────
+    /// <summary>Đặt cọc vào ô. Ô đã có cọc khác → hoán đổi (hoặc đẩy cọc kia về khay).
+    /// Tự chọn hướng (dọc / xoay ngang) cho vừa; không vừa cả 2 hướng thì không đặt (trả false).</summary>
+    public bool Place(string columnId, int ci, int row, int lane)
+    {
+        if (Column(columnId) is null) return false;
+        if (ci < 0 || ci >= ContainerCount || row < 0 || row >= MaxRowIndex || lane < 0 || lane >= Lanes) return false;
+
+        var before = Snapshot();
+        if (!PlaceCore(columnId, ci, row, lane)) return false;
+
+        // Thử hướng đang có rồi hướng còn lại; ưu tiên hướng tốn ít chiều dài sàn.
+        var x = PlacementOf(columnId)!;
+        var touched = Placements.Select(o => o.ContainerIndex).Distinct().ToList();
+        var keep = x.Rotated;
+        var options = new List<(bool Rot, double Used)>();
+        foreach (var rot in new[] { keep, !keep })
+        {
+            x.Rotated = rot;
+            if (touched.All(ContainerFits)) options.Add((rot, UsedLength(ci)));
+        }
+        if (options.Count == 0)
+        {
+            Restore(before);
+            return false;
+        }
+        x.Rotated = options.OrderBy(o => o.Used).First().Rot;
+        Dirty = true;
+        return true;
+    }
+
+    /// <summary>Xoay ngang / dọc cọc đã đặt. Không vừa hàng / container thì giữ nguyên (trả false).</summary>
+    public bool Rotate(string columnId)
+    {
+        if (PlacementOf(columnId) is not { } x) return false;
+        x.Rotated = !x.Rotated;
+        if (ContainerFits(x.ContainerIndex))
+        {
+            Dirty = true;
+            return true;
+        }
+        x.Rotated = !x.Rotated;
+        return false;
+    }
+
+    /// <summary>Ô này đặt được cọc không (thử cả 2 hướng, không đổi sơ đồ) — để tô ô đích khi kéo / cầm cọc.</summary>
+    public bool CanPlace(string columnId, int ci, int row, int lane)
+    {
+        var before = Snapshot();
+        var dirty = Dirty;
+        var ok = Place(columnId, ci, row, lane);
+        Restore(before);
+        Dirty = dirty;
+        return ok;
+    }
+
+    private List<SwPlacement> Snapshot()
+        => Placements.Select(x => new SwPlacement
+        {
+            ContainerIndex = x.ContainerIndex, Row = x.Row, Lane = x.Lane, ColumnId = x.ColumnId, Rotated = x.Rotated,
+        }).ToList();
+
+    private void Restore(List<SwPlacement> snap)
+    {
+        Placements.Clear();
+        Placements.AddRange(snap);
+    }
+
+    private bool PlaceCore(string columnId, int ci, int row, int lane)
+    {
+        var current = PlacementOf(columnId);
+        var occupant = SlotAt(ci, row, lane);
+        if (occupant?.ColumnId == columnId) return false;
+
+        if (occupant is not null)
+        {
+            if (current is not null)
+            {
+                occupant.ContainerIndex = current.ContainerIndex;
+                occupant.Row = current.Row;
+                occupant.Lane = current.Lane;
+            }
+            else
+            {
+                Placements.Remove(occupant);
+            }
+        }
+
+        if (current is not null)
+        {
+            current.ContainerIndex = ci;
+            current.Row = row;
+            current.Lane = lane;
+        }
+        else
+        {
+            Placements.Add(new SwPlacement { ContainerIndex = ci, Row = row, Lane = lane, ColumnId = columnId });
+        }
+        return true;
+    }
+
+    public void Unplace(string columnId)
+    {
+        if (Placements.RemoveAll(x => x.ColumnId == columnId) > 0) Dirty = true;
+    }
+
+    public void AddContainer()
+    {
+        ContainerCount++;
+        Dirty = true;
+    }
+
+    public void RemoveContainer(int ci)
+    {
+        if (ContainerCount <= 1 || ci < 0 || ci >= ContainerCount) return;
+        Placements.RemoveAll(x => x.ContainerIndex == ci);
+        foreach (var x in Placements.Where(x => x.ContainerIndex > ci)) x.ContainerIndex--;
+        ContainerCount--;
+        Dirty = true;
+    }
+
+    public ContainerMetric Metric(int ci)
+    {
+        var lanes = new double[Lanes];
+        double total = 0, front = 0, back = 0;
+        int count = 0, maxRow = -1;
+
+        var half = Spec.InnerLength / 2.0;
+        foreach (var x in Placements.Where(x => x.ContainerIndex == ci))
+        {
+            var c = Column(x.ColumnId);
+            if (c is null) continue;
+            var w = ColumnWeight(c);
+            total += w;
+            count++;
+            if (x.Lane < lanes.Length) lanes[x.Lane] += w;
+            // trước / sau theo tâm cọc so với giữa chiều dài cont
+            if (RowOffset(ci, x.Row) + Extent(c, x.Rotated).Depth / 2 < half) front += w; else back += w;
+            maxRow = Math.Max(maxRow, x.Row);
+        }
+
+        var used = maxRow + 1;
+        return new ContainerMetric(total, lanes, front, back, count, used,
+            Math.Max(0, Spec.InnerLength - UsedLength(ci)));
+    }
+
+    // ── Đồng bộ trạng thái ───────────────────────────────────
+    /// <summary>Dọn rỗng / trùng, đảm bảo mọi pallet thuộc 1 cọc, xoá cache layout, đánh dấu chưa lưu.</summary>
+    public void Commit()
+    {
+        Normalize();
+        Dirty = true;
+    }
+
+    public void InvalidateLayout(string? palletId = null)
+    {
+        if (palletId is null) _layouts.Clear(); else _layouts.Remove(palletId);
+    }
+
+    private void Normalize()
+    {
+        _layouts.Clear();
+
+        // 1. Box không tồn tại / nằm ở 2 pallet.
+        var seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        foreach (var p in Pallets) p.BoxNos.RemoveAll(b => !Boxes.ContainsKey(b) || !seen.Add(b));
+
+        // 2. Pallet rỗng.
+        Pallets.RemoveAll(p => p.BoxNos.Count == 0);
+        var ids = Pallets.Select(p => p.Id).ToHashSet();
+
+        // 3. Cọc trỏ tới pallet không còn / trùng; pallet trên rơi xuống dưới nếu thiếu đáy.
+        var used = new HashSet<string>();
+        foreach (var c in Columns)
+        {
+            if (c.Bottom is not null && (!ids.Contains(c.Bottom) || !used.Add(c.Bottom))) c.Bottom = null;
+            if (c.Top is not null && (!ids.Contains(c.Top) || !used.Add(c.Top))) c.Top = null;
+            if (c.Bottom is null && c.Top is not null) (c.Bottom, c.Top) = (c.Top, null);
+        }
+        Columns.RemoveAll(c => c.Bottom is null);
+
+        // 3b. Pallet dưới phải đầy 1 mặt: pallet trên đầy mặt thì đảo xuống, không thì tách pallet trên ra cọc đơn.
+        foreach (var c in Columns.Where(c => c.Top is not null))
+        {
+            if (Layout(Pallet(c.Bottom)!).FullTop) continue;
+            if (Layout(Pallet(c.Top)!).FullTop) (c.Bottom, c.Top) = (c.Top, c.Bottom);
+            else { used.Remove(c.Top!); c.Top = null; }
+        }
+
+        // 4. Pallet chưa thuộc cọc → cọc đơn.
+        foreach (var p in Pallets.Where(p => !used.Contains(p.Id)))
+            Columns.Add(new SwColumn { Id = NewId("TMP-COL"), Code = NextCode("C", Columns.Select(c => c.Code)), Bottom = p.Id });
+
+        // 5. Vị trí: cọc không còn, ngoài phạm vi, trùng ô, trùng cọc.
+        var colIds = Columns.Select(c => c.Id).ToHashSet();
+        var slots = new HashSet<(int, int, int)>();
+        var placedCols = new HashSet<string>();
+        Placements.RemoveAll(x =>
+            !colIds.Contains(x.ColumnId)
+            || x.ContainerIndex < 0 || x.ContainerIndex >= ContainerCount
+            || x.Row < 0 || x.Row >= MaxRowIndex || x.Lane < 0 || x.Lane >= Lanes
+            || !slots.Add((x.ContainerIndex, x.Row, x.Lane))
+            || !placedCols.Add(x.ColumnId));
+
+        // 6. Cọc đổi mặt bằng (chuyển thùng) làm container quá dài / hàng quá rộng:
+        //    thử xoay cọc sát cửa nhất, không được thì trả cọc đó về khay.
+        for (var ci = 0; ci < ContainerCount; ci++)
+        {
+            while (!ContainerFits(ci))
+            {
+                var last = In(ci).OrderByDescending(x => x.Row).ThenByDescending(x => x.Lane).FirstOrDefault();
+                if (last is null) break;
+                last.Rotated = !last.Rotated;
+                if (ContainerFits(ci)) break;
+                last.Rotated = !last.Rotated;
+                Placements.Remove(last);
+            }
+        }
+    }
+
+    /// <summary>Xoá sạch pallet / cọc / vị trí — dùng cho "Tự động xếp".</summary>
+    public void ResetBuild()
+    {
+        Pallets.Clear();
+        Columns.Clear();
+        Placements.Clear();
+        ContainerCount = 1;
+        _layouts.Clear();
+    }
+
+    // ── Helper ───────────────────────────────────────────────
+    public static string NewId(string prefix) => $"{prefix}-{Guid.NewGuid():N}"[..(prefix.Length + 13)];
+
+    public static string NextCode(string prefix, IEnumerable<string> codes)
+    {
+        var max = codes.Select(CodeNum).DefaultIfEmpty(0).Max();
+        return $"{prefix}{max + 1:00}";
+    }
+
+    private static int CodeNum(string code)
+    {
+        var digits = new string(code.SkipWhile(ch => !char.IsDigit(ch)).TakeWhile(char.IsDigit).ToArray());
+        return int.TryParse(digits, out var n) ? n : 0;
+    }
+
+    internal static bool Same(string? a, string? b) => string.Equals(a, b, StringComparison.OrdinalIgnoreCase);
+
+    public static string N(double v) => v.ToString("0.#", CultureInfo.InvariantCulture);
+
+    private static bool IsHex(string? c)
+        => c is { Length: 7 } && c[0] == '#' && c.Skip(1).All(Uri.IsHexDigit);
+
+}
