@@ -14,6 +14,8 @@ namespace Swms.FinishGoods.Web.Features.StowagePlan.Business;
 ///     cùng SI gom chung pallet (first-fit decreasing theo chiều cao), tầng dưới phải đầy:
 ///     mỗi pallet tối đa 1 tầng chưa đầy và tầng đó nằm trên cùng.
 ///   • Phần dư không ghép được: CHIA ĐỀU số tầng của model cho các pallet của nó (chênh tối đa 1 tầng).
+///   • FCL VỪA KHÍT CỘT: cọc cao tới đúng lòng cont (40HC 253, gồm đế). Chia ½ cont mất 1 tầng thì soạn cặp
+///     pallet dưới hơn pallet trên 1 tầng (VD thùng 50,5: 3 + 2 = 252,5) và ưu tiên chồng đúng cặp; > 252 cảnh báo.
 ///   • CHIA ĐỀU CHIỀU CAO mọi pallet của SI: giữ số pallet, chuyển tầng đầy từ pallet cao sang pallet thấp.
 ///   • Cọc: FCL ưu tiên dàn hết pallet đơn ra sàn tới tận cửa container; chỉ chồng cọc đôi khi sàn
 ///     số container tối thiểu thật sự không đủ (xếp thử, lấy số cọc đôi ít nhất). Cọc đôi: pallet dưới phải ĐẦY 1 mặt (không có tầng thiếu);
@@ -29,25 +31,29 @@ public static class StowageAutoPlanner
     public static void Run(StowageWorkspace ws)
     {
         ws.ResetBuild();
-        BuildPallets(ws);
-        BuildColumnsAndPlace(ws);
+        var fitPairs = BuildPallets(ws);
+        BuildColumnsAndPlace(ws, fitPairs);
         ws.Commit();
     }
 
     // ── 1. Soạn pallet ───────────────────────────────────────
     // Mỗi SI riêng (1 SI / pallet). Đơn vị xếp là TẦNG (1 model, đủ 1 mặt; tầng thiếu luôn trên cùng):
     //   a. Mỗi model: số pallet đầy cao (đủ số tầng tối đa) đứng riêng 1 model.
+    //      FCL VỪA KHÍT CỘT: cọc 2 pallet cao tới đúng lòng cont (gồm 2 đế). Khi chia ½ cont bị mất 1 tầng
+    //      (VD thùng 50,5 thùng rời: ½ = 2 + 2 tầng = 202, cả cột được 5 tầng = 252,5) thì model đó soạn
+    //      theo CẶP: pallet dưới nhiều hơn pallet trên 1 tầng (3 + 2), đánh dấu để ghép cọc ưu tiên chồng đúng cặp.
     //   b. Phần dư của các model (vài tầng) gom lại bằng first-fit decreasing: phần dư cao nhất trước,
     //      đặt vào pallet dư đang cao nhất mà còn vừa -> ÍT PALLET NHẤT, ít model lẫn nhất.
     //      Điều kiện chung pallet: tổng cao ≤ chiều cao tối đa, tối đa 1 tầng thiếu,
     //      tổng số tầng ≤ layer_limit nhỏ nhất của các model trong pallet.
     //   c. Phần dư không ghép được với model khác -> chia đều lại số tầng của model đó
-    //      cho các pallet của nó (chênh tối đa 1 tầng).
+    //      cho các pallet của nó (chênh tối đa 1 tầng). Cặp vừa khít cột giữ nguyên.
     //   d. CHIA ĐỀU CHIỀU CAO mọi pallet của SI (quy tắc 6, áp AIR / LCL / FCL): giữ nguyên số pallet,
     //      chuyển dần từng TẦNG ĐẦY từ pallet cao nhất sang pallet thấp nhất (chỉ khi sau khi chuyển
     //      pallet nhận vẫn thấp hơn pallet cho) -> không còn pallet 120 cm đứng cạnh pallet ghép 69 cm.
     //      Tầng thiếu không chuyển (vẫn nằm trên cùng); vẫn giữ cao tối đa và layer_limit;
     //      ưu tiên chuyển tầng của model đã có trên pallet nhận (ít lẫn model).
+    //      Cặp vừa khít cột KHÔNG tham gia (chia đều sẽ làm cột mất tầng).
     private sealed class Layer
     {
         public string Model = "";
@@ -65,9 +71,8 @@ public static class StowageAutoPlanner
         public double Height => Layers.Count * LayerH;
         public bool HasPartial;
         public int Limit;               // tổng tầng của pallet chứa model không quá layer_limit
-        public int MaxLayers;
-        public List<Layer> PureLayers = new();   // các tầng thuộc pallet đầy cao của model
-        public int PureCount;
+        public List<List<Layer>> Pure = new();                          // pallet đầy cao 1 model
+        public List<(List<Layer> Bottom, List<Layer> Top)> Pairs = new(); // FCL: cặp vừa khít cột
     }
 
     private sealed class Bin
@@ -85,9 +90,12 @@ public static class StowageAutoPlanner
         public double Height => Layers.Sum(l => l.H);
         public int Limit => Layers.Count == 0 ? int.MaxValue : Layers.Min(l => l.Limit);
         public List<SwBox> Boxes => Layers.SelectMany(l => l.Boxes).ToList();
+        public PalletStack? PairTop;    // pallet dưới của cặp vừa khít cột -> pallet trên của cặp
+        public bool Locked;             // thuộc cặp vừa khít cột: không chia đều chiều cao
     }
 
-    private static void BuildPallets(StowageWorkspace ws)
+    /// <summary>Soạn pallet cho mọi SI. Trả các cặp (dưới, trên) vừa khít cột để ghép cọc ưu tiên.</summary>
+    private static List<(SwPallet Bottom, SwPallet Top)> BuildPallets(StowageWorkspace ws)
     {
         var siOrder = ws.Sis.Select((s, i) => (s.SiNo, i))
             .ToDictionary(x => x.SiNo, x => x.i, StringComparer.OrdinalIgnoreCase);
@@ -96,33 +104,41 @@ public static class StowageAutoPlanner
             .GroupBy(b => b.SiNo, StringComparer.OrdinalIgnoreCase)
             .OrderBy(g => siOrder.GetValueOrDefault(g.Key, int.MaxValue));
 
+        var pairs = new List<(SwPallet Bottom, SwPallet Top)>();
         foreach (var si in bySi)
         {
             // Đế theo packing type của SI (PLASTIC PALLET, Paper pallet, SLIP SHEET, thùng rời…)
-            var usableH = ws.MaxPalletHeight - StowageWorkspace.BaseHeightOf(ws.BaseOfSi(si.Key));
+            var baseH = StowageWorkspace.BaseHeightOf(ws.BaseOfSi(si.Key));
+            var usableH = ws.MaxPalletHeight - baseH;
+            // FCL: chiều cao xếp thùng của cả cọc 2 pallet (lòng cont trừ 2 đế); AIR / LCL không chồng
+            double? columnH = ws.NoCombine ? null : ws.Spec.InnerHeight - 2 * baseH;
 
             // a–c: số pallet ít nhất
-            var stacks = PackSi(ws, si.Key, si.ToList(), usableH);
-            var pallets = stacks.Select(s => s.Boxes).ToList();
+            var stacks = PackSi(ws, si.Key, si.ToList(), usableH, columnH);
+            var boxesOf = stacks.ToDictionary(s => s, s => s.Boxes);
 
-            // d. Chia đều chiều cao; bố trí thật sai quy tắc (cao quá / 2 tầng thiếu) thì giữ bản chưa chia
-            if (Level(stacks, usableH))
-            {
-                var leveled = stacks.Select(s => s.Boxes).ToList();
-                if (leveled.All(b =>
-                    {
-                        var lay = Probe(ws, si.Key, b);
-                        return lay.Height <= ws.MaxPalletHeight + 0.01 && lay.PartialLayers <= 1;
-                    }))
-                    pallets = leveled;
-            }
+            // d. Chia đều chiều cao (trừ cặp vừa khít cột); bố trí thật sai quy tắc thì giữ bản chưa chia
+            var free = stacks.Where(s => !s.Locked).ToList();
+            if (Level(free, usableH)
+                && free.All(s =>
+                {
+                    var lay = Probe(ws, si.Key, s.Boxes);
+                    return lay.Height <= ws.MaxPalletHeight + 0.01 && lay.PartialLayers <= 1;
+                }))
+                foreach (var s in free) boxesOf[s] = s.Boxes;
 
-            foreach (var b in pallets) AddPallet(ws, si.Key, b);
+            var pallets = new Dictionary<PalletStack, SwPallet>();
+            foreach (var s in stacks) pallets[s] = AddPallet(ws, si.Key, boxesOf[s]);
+            foreach (var s in stacks)
+                if (s.PairTop is { } top && pallets.TryGetValue(top, out var tp))
+                    pairs.Add((pallets[s], tp));
         }
+        return pairs;
     }
 
-    // a–c cho 1 SI với chiều cao xếp cho phép (không gồm đế) = cap.
-    private static List<PalletStack> PackSi(StowageWorkspace ws, string siNo, List<SwBox> si, double cap)
+    // a–c cho 1 SI. cap = chiều cao xếp thùng 1 pallet (không gồm đế);
+    // columnH = chiều cao xếp thùng của cả cọc 2 pallet (FCL), null = không chồng.
+    private static List<PalletStack> PackSi(StowageWorkspace ws, string siNo, List<SwBox> si, double cap, double? columnH)
     {
         var result = new List<PalletStack>();
         PalletStack Of(IEnumerable<Layer> layers) => new() { Layers = layers.ToList() };
@@ -135,9 +151,9 @@ public static class StowageAutoPlanner
         {
             var boxes = model.OrderBy(b => b.BoxNo).ToList();
             var f = boxes[0];
-            var maxLayers = Math.Max(1, (int)Math.Floor((cap + 0.01) / Math.Max(1, f.H)));
+            var h = Math.Max(1, f.H);
             var limit = f.LayerLimit is int lim && lim > 0 ? lim : int.MaxValue;
-            maxLayers = Math.Min(maxLayers, limit);
+            var maxLayers = Math.Min(Math.Max(1, (int)Math.Floor((cap + 0.01) / h)), limit);
             var perLayer = Math.Max(1, StowageWorkspace.PerLayer(f));
 
             var layers = new List<Layer>();
@@ -147,19 +163,36 @@ public static class StowageAutoPlanner
                 layers.Add(new Layer { Model = model.Key, Boxes = lb, H = f.H, Full = lb.Count == perLayer, Limit = limit });
             }
 
-            var pureCount = layers.Count / maxLayers;
-            var rest = layers.Skip(pureCount * maxLayers).ToList();
-            rems.Add(new Rem
+            var rem = new Rem { Model = model.Key, LayerH = f.H, Limit = limit };
+            var at = 0;
+
+            // FCL vừa khít cột: cả cột được nhiều hơn 2 × maxLayers tầng -> soạn cặp (dưới = trên + 1 tầng).
+            // Cặp chỉ lấy tầng đầy (tầng thiếu luôn nằm ở phần dư).
+            if (columnH is double colH)
             {
-                Model = model.Key,
-                Layers = rest,
-                LayerH = f.H,
-                HasPartial = rest.Count > 0 && !rest[^1].Full,
-                Limit = limit,
-                MaxLayers = maxLayers,
-                PureLayers = layers.Take(pureCount * maxLayers).ToList(),
-                PureCount = pureCount,
-            });
+                var column = (int)Math.Floor((colH + 0.01) / h);
+                var topN = Math.Min(column / 2, limit);
+                var bottomN = Math.Min(column - column / 2, limit);
+                if (bottomN > maxLayers && topN >= 1)
+                {
+                    var fullCount = layers.Count(l => l.Full);
+                    while (at + bottomN + topN <= fullCount)
+                    {
+                        rem.Pairs.Add((layers.Skip(at).Take(bottomN).ToList(), layers.Skip(at + bottomN).Take(topN).ToList()));
+                        at += bottomN + topN;
+                    }
+                }
+            }
+
+            while (at + maxLayers <= layers.Count)
+            {
+                rem.Pure.Add(layers.Skip(at).Take(maxLayers).ToList());
+                at += maxLayers;
+            }
+
+            rem.Layers = layers.Skip(at).ToList();
+            rem.HasPartial = rem.Layers.Count > 0 && !rem.Layers[^1].Full;
+            rems.Add(rem);
         }
 
         // b. Gom phần dư: cao nhất trước, vào pallet dư cao nhất còn vừa (best-fit)
@@ -176,14 +209,21 @@ public static class StowageAutoPlanner
             target.Parts.Add(r);
         }
 
-        // c. Model có phần dư đứng riêng -> chia đều tầng cho các pallet của model
+        // c. Cặp vừa khít cột giữ nguyên; model có phần dư đứng riêng -> chia đều tầng cho các pallet đầy cao của model
         var soloModels = bins.Where(b => b.Parts.Count == 1).Select(b => b.Parts[0]).ToHashSet();
         foreach (var r in rems)
         {
-            if (soloModels.Contains(r) && r.PureCount > 0)
+            foreach (var (bottom, top) in r.Pairs)
             {
-                var all = r.PureLayers.Concat(r.Layers).ToList();      // tầng thiếu (nếu có) ở cuối
-                var pallets = r.PureCount + 1;
+                var t = new PalletStack { Layers = top, Locked = true };
+                result.Add(new PalletStack { Layers = bottom, Locked = true, PairTop = t });
+                result.Add(t);
+            }
+
+            if (soloModels.Contains(r) && r.Pure.Count > 0)
+            {
+                var all = r.Pure.SelectMany(x => x).Concat(r.Layers).ToList();      // tầng thiếu (nếu có) ở cuối
+                var pallets = r.Pure.Count + 1;
                 var baseLayers = all.Count / pallets;
                 var extra = all.Count % pallets;
                 var taken = 0;
@@ -196,13 +236,12 @@ public static class StowageAutoPlanner
                 continue;
             }
 
-            for (var i = 0; i < r.PureCount; i++)
-                result.Add(Of(r.PureLayers.Skip(i * r.MaxLayers).Take(r.MaxLayers)));
+            foreach (var p in r.Pure) result.Add(Of(p));
         }
 
         foreach (var bin in bins)
         {
-            if (bin.Parts.Count == 1 && bin.Parts[0].PureCount > 0) continue;     // đã chia đều ở trên
+            if (bin.Parts.Count == 1 && bin.Parts[0].Pure.Count > 0) continue;     // đã chia đều ở trên
             var stack = Of(bin.Parts.SelectMany(r => r.Layers));
 
             // Kiểm lại bằng bố trí thật (gộp theo cỡ thùng); sai quy tắc thì tách từng phần dư ra pallet riêng
@@ -296,8 +335,9 @@ public static class StowageAutoPlanner
     //   1. C = số container ít nhất = max(khi chồng hết mức có thể, theo tải trọng) — xếp thử thật (Fill),
     //      không ước tính theo ô sàn.
     //   2. Tìm số cọc đôi ÍT NHẤT mà mọi cọc vẫn vừa C container -> sàn kín tới cửa, ít chồng nhất.
+    //   Cọc đôi dùng trước các CẶP VỪA KHÍT CỘT đã soạn ở bước 1 (cột cao tới đúng lòng cont).
     // AIR / LCL không chồng: mọi pallet là cọc đơn.
-    private static void BuildColumnsAndPlace(StowageWorkspace ws)
+    private static void BuildColumnsAndPlace(StowageWorkspace ws, List<(SwPallet Bottom, SwPallet Top)> fitPairs)
     {
         var n = ws.Pallets.Count;
         if (n == 0)
@@ -308,7 +348,7 @@ public static class StowageAutoPlanner
 
         if (ws.NoCombine)
         {
-            BuildColumns(ws, 0);
+            BuildColumns(ws, 0, fitPairs);
             PlaceColumns(ws, null);
             return;
         }
@@ -318,7 +358,7 @@ public static class StowageAutoPlanner
         int Needed(int doubles, int start)
         {
             ws.Columns.Clear();
-            BuildColumns(ws, doubles);
+            BuildColumns(ws, doubles, fitPairs);
             return Fill(ws, Order(ws), start, apply: false);
         }
 
@@ -334,18 +374,33 @@ public static class StowageAutoPlanner
         }
 
         ws.Columns.Clear();
-        BuildColumns(ws, lo);
+        BuildColumns(ws, lo, fitPairs);
         PlaceColumns(ws, target);
     }
 
-    // Cọc đôi: lấy từ các pallet thấp nhất, ghép cao + thấp để cọc đôi cao gần nhau;
-    // pallet dưới phải đầy mặt; tổng cao phải vừa lòng cont.
-    private static void BuildColumns(StowageWorkspace ws, int doublesNeeded)
+    // Cọc đôi: trước hết các cặp vừa khít cột (bước 1); còn thiếu thì lấy từ các pallet thấp nhất,
+    // ghép cao + thấp để cọc đôi cao gần nhau; pallet dưới phải đầy mặt; tổng cao ≤ lòng cont.
+    private static void BuildColumns(StowageWorkspace ws, int doublesNeeded, List<(SwPallet Bottom, SwPallet Top)> fitPairs)
     {
-        var pool = ws.Pallets.OrderByDescending(p => ws.Layout(p).Weight).ToList();
-        var n = pool.Count;
-        if (n == 0) return;
+        if (ws.Pallets.Count == 0) return;
         if (ws.NoCombine) doublesNeeded = 0;
+
+        // Cặp vừa khít cột: chồng đúng cặp (pallet dưới nhiều hơn 1 tầng)
+        var paired = new HashSet<string>();
+        foreach (var (bottom, top) in fitPairs
+                     .Where(x => ws.Pallets.Contains(x.Bottom) && ws.Pallets.Contains(x.Top))
+                     .OrderByDescending(x => ws.Layout(x.Bottom).Height + ws.Layout(x.Top).Height))
+        {
+            if (doublesNeeded <= 0) break;
+            if (ws.Layout(bottom).Height + ws.Layout(top).Height > ws.Spec.InnerHeight + 0.01) continue;
+            AddColumn(ws, bottom, top);
+            paired.Add(bottom.Id);
+            paired.Add(top.Id);
+            doublesNeeded--;
+        }
+
+        var pool = ws.Pallets.Where(p => !paired.Contains(p.Id)).OrderByDescending(p => ws.Layout(p).Weight).ToList();
+        if (pool.Count == 0) return;
 
         // Cọc đôi lấy từ các pallet THẤP nhất (dễ vừa chiều cao lòng cont).
         // Quy tắc: pallet dưới phải ĐẦY 1 mặt (không có tầng thiếu) → mỗi cọc đôi cần ít nhất 1 pallet FullTop.
@@ -380,7 +435,7 @@ public static class StowageAutoPlanner
         for (var i = 0; i < pairs; i++)
         {
             SwPallet bottom = bottoms[i], top = tops[i];
-            if (ws.Layout(bottom).Height + ws.Layout(top).Height > ws.Spec.InnerHeight)
+            if (ws.Layout(bottom).Height + ws.Layout(top).Height > ws.Spec.InnerHeight + 0.01)
             {
                 singles.Add(bottom);
                 singles.Add(top);
