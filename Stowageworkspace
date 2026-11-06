@@ -109,6 +109,26 @@ public sealed record ContainerMetric(
     double Weight, double[] LaneWeight, double FrontWeight, double BackWeight,
     int ColumnCount, int RowsUsed, double FreeLength);
 
+/// <summary>Quy tắc xếp theo ship mode.</summary>
+/// <param name="Combine">Cho chồng 2 pallet.</param>
+/// <param name="MaxPalletHeight">Cao tối đa 1 pallet gồm đế (cm); null = ½ chiều cao lòng thùng.</param>
+/// <param name="TallFirst">true = cọc cao vào trong, thấp ra cửa; false = cọc nặng trước.</param>
+/// <param name="WarnPartial">Cảnh báo pallet thấp &lt; 75% giới hạn.</param>
+public sealed record ShipModeRule(string Code, bool Combine, double? MaxPalletHeight, bool TallFirst, bool WarnPartial)
+{
+    public static readonly ShipModeRule Air   = new("AIR",   Combine: false, MaxPalletHeight: 140,  TallFirst: false, WarnPartial: false);
+    public static readonly ShipModeRule Lcl   = new("LCL",   Combine: false, MaxPalletHeight: 160,  TallFirst: false, WarnPartial: false);
+    public static readonly ShipModeRule Fcl   = new("FCL",   Combine: true,  MaxPalletHeight: null, TallFirst: true,  WarnPartial: true);
+    /// <summary>Xe tải: sàn = thùng xe của chuyến; chồng được nếu vừa lòng thùng, cao vào trong / thấp ra cửa sau.</summary>
+    public static readonly ShipModeRule Truck = new("TRUCK", Combine: true,  MaxPalletHeight: null, TallFirst: true,  WarnPartial: true);
+
+    public static readonly IReadOnlyList<ShipModeRule> All = new[] { Air, Lcl, Fcl, Truck };
+
+    /// <summary>Mode không nhận ra (hoặc null) -> theo FCL như trước.</summary>
+    public static ShipModeRule Of(string? mode)
+        => All.FirstOrDefault(r => string.Equals(r.Code, mode?.Trim(), StringComparison.OrdinalIgnoreCase)) ?? Fcl;
+}
+
 public sealed class StowageWorkspace
 {
     public const int PalletPitch = 120;   // 1 vị trí pallet theo chiều dài container (cm)
@@ -159,16 +179,16 @@ public sealed class StowageWorkspace
     private readonly Dictionary<string, PalletLayout> _layouts = new();
 
     // ── Quy tắc ──────────────────────────────────────────────
-    /// <summary>AIR / LCL không combine (không chồng 2 pallet).</summary>
-    public bool NoCombine => Mode is "AIR" or "LCL";
+    /// <summary>Quy tắc theo ship mode. Thêm mode mới = thêm 1 dòng ở <see cref="ShipModeRule.All"/>.</summary>
+    public ShipModeRule Rule => ShipModeRule.Of(Mode);
 
-    /// <summary>Cao tối đa 1 pallet (gồm đế): AIR 140, LCL 160, FCL = nửa chiều cao lòng cont.</summary>
-    public double MaxPalletHeight => Mode switch
-    {
-        "AIR" => 140,
-        "LCL" => 160,
-        _ => Math.Floor(Spec.InnerHeight / 2.0),
-    };
+    /// <summary>Không combine (không chồng 2 pallet): AIR / LCL.</summary>
+    public bool NoCombine => !Rule.Combine;
+
+    /// <summary>Cao tối đa 1 pallet (gồm đế): AIR 140, LCL 160, FCL / TRUCK = nửa chiều cao lòng thùng.
+    /// Luôn ≤ chiều cao lòng thùng / cont.</summary>
+    public double MaxPalletHeight
+        => Math.Min(Rule.MaxPalletHeight ?? Math.Floor(Spec.InnerHeight / 2.0), Spec.InnerHeight);
 
     /// <summary>Giới hạn chặn 1 pallet: AIR / LCL = <see cref="MaxPalletHeight"/>; FCL = lòng cont
     /// (pallet dưới của cọc vừa khít được cao hơn ½ cont, VD 3 tầng + 2 tầng).</summary>
@@ -598,7 +618,7 @@ public sealed class StowageWorkspace
         var lay = Layout(p);
         if (lay.Height > PalletHardLimit + 0.01)
             yield return new("bad", "StowagePlan.Flag.PalletOverHeight", N(lay.Height), N(PalletHardLimit));
-        else if (!NoCombine && lay.Height < MaxPalletHeight * 0.75)
+        else if (Rule.WarnPartial && lay.Height < MaxPalletHeight * 0.75)
             yield return new("warn", "StowagePlan.Flag.Partial");
 
         var models = BoxesOf(p).Select(b => b.Model).Distinct().Count();
