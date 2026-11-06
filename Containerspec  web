@@ -1,18 +1,53 @@
+using System.Globalization;
+using System.Text.RegularExpressions;
+
 namespace Swms.FinishGoods.Web.Features.StowagePlan.Business.Models;
 
 /// <summary>
-/// Kích thước lòng container / ULD (cm) + tải trọng tối đa (kg).
+/// Kích thước lòng container / ULD / thùng xe tải (cm) + tải trọng tối đa (kg).
 /// Kích thước thùng thực tế (D × R × C): 20F 580 × 231 × 223, 40F 1193 × 231 × 223, 40HC 1193 × 231 × 253.
 /// 45HC / PMC còn là số chuẩn — cần số thực tế thì thay.
+/// Xe tải (ship mode TRUCK): xem <see cref="Trucks"/>; mã "TRK-5T", nhận cả "5T", "5 tấn", "TRUCK 5T", "1,25T".
 /// Nhận cả mã của màn Chuyến xe (20F, 40F, 40H, 45H) lẫn mã dài (20'GP, 40'HC…).
 /// Phải giống ContainerSpec phía API (Features/StowagePlans/Business/ContainerSpec.cs).
 /// </summary>
 public sealed record ContainerSpec(string Code, int InnerLength, int InnerWidth, int InnerHeight, int MaxPayload)
 {
+    /// <summary>Thùng xe tải theo tải trọng (tấn): D × R × C lòng thùng (cm), tải trọng = số tấn.</summary>
+    public static readonly IReadOnlyList<(decimal Ton, ContainerSpec Spec)> Trucks = new[]
+    {
+        (1.25m, new ContainerSpec("TRK-1.25T", 300, 157, 154, 1250)),
+        (1.9m,  new ContainerSpec("TRK-1.9T",  420, 167, 154, 1900)),
+        (3.5m,  new ContainerSpec("TRK-3.5T",  380, 197, 184, 3500)),
+        (5m,    new ContainerSpec("TRK-5T",    610, 207, 194, 5000)),
+        (8m,    new ContainerSpec("TRK-8T",    740, 231, 219, 8000)),
+        (9m,    new ContainerSpec("TRK-9T",    720, 227, 204, 9000)),
+        (11m,   new ContainerSpec("TRK-11T",   790, 231, 224, 11000)),
+    };
+
+    /// <summary>Xe tải lớn nhất — sàn mặc định cho chuyến TRUCK chưa ghi cỡ xe.</summary>
+    public static ContainerSpec LargestTruck => Trucks[^1].Spec;
+
+    public bool IsTruck => Code.StartsWith("TRK", StringComparison.Ordinal);
+
+    // "TRK-5T", "5T", "5TAN", "5TẤN", "TRUCK5T", "XE1,25T" (đã bỏ dấu cách, viết hoa)
+    private static readonly Regex TruckCode = new(@"^(?:TRK|TRUCK|XE)?-?(\d+(?:[.,]\d+)?)(?:T|TAN|TẤN|TON)$", RegexOptions.Compiled);
+
+    /// <summary>Mã xe tải -> thùng xe; không phải mã xe tải / cỡ không có trong bảng -> null.</summary>
+    public static ContainerSpec? Truck(string? size)
+    {
+        var m = TruckCode.Match(Normalize(size));
+        if (!m.Success) return null;
+        if (!decimal.TryParse(m.Groups[1].Value.Replace(',', '.'), NumberStyles.Number, CultureInfo.InvariantCulture, out var ton))
+            return null;
+        return Trucks.FirstOrDefault(x => x.Ton == ton).Spec;
+    }
+
     public static ContainerSpec Of(string? type)
     {
-        var t = (type ?? "").Replace('’', '\'').Replace("'", "").Replace(" ", "").ToUpperInvariant();
+        if (Truck(type) is { } truck) return truck;
 
+        var t = Normalize(type);
         if (t.Contains("PMC")) return new("PMC", 317, 243, 160, 4600);
         if (t.StartsWith("45")) return new("45'HC", 1355, 235, 269, 27700);
         if (t.StartsWith("20")) return new("20'GP", 580, 231, 223, 28200);
@@ -21,4 +56,7 @@ public sealed record ContainerSpec(string Code, int InnerLength, int InnerWidth,
         if (t.StartsWith("40")) return new("40'GP", 1193, 231, 223, 26700);
         return new("40'HC", 1193, 231, 253, 26500);
     }
+
+    private static string Normalize(string? type)
+        => (type ?? "").Replace('’', '\'').Replace("'", "").Replace(" ", "").ToUpperInvariant();
 }
